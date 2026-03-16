@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AO4C Cross-Chain Lab</title>
+  <script src="/web3.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Segoe UI', Arial, sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; }
+    header { background: linear-gradient(135deg, #1e40af, #7c3aed); padding: 20px 40px; }
+    header h1 { font-size: 1.6rem; font-weight: 700; }
+    header .subtitle { font-size: 0.85rem; opacity: 0.8; margin-top: 4px; }
+    .container { max-width: 1200px; margin: 0 auto; padding: 32px 24px; }
+    .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-bottom: 28px; }
+    .card { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 20px; }
+    .card h2 { font-size: 1rem; font-weight: 600; color: #94a3b8; margin-bottom: 14px; text-transform: uppercase; letter-spacing: 0.05em; }
+    .badge { display: inline-block; padding: 2px 10px; border-radius: 99px; font-size: 0.75rem; font-weight: 600; margin-left: 8px; }
+    .badge-a { background: #1d4ed8; color: #bfdbfe; }
+    .badge-b { background: #6d28d9; color: #ddd6fe; }
+    .info-row { display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 0.88rem; }
+    .info-row .label { color: #64748b; }
+    .info-row .value { font-family: monospace; color: #a5f3fc; word-break: break-all; max-width: 240px; text-align: right; }
+    .info-row .balance { color: #34d399; font-weight: 600; }
+    .form-card { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 24px; margin-bottom: 28px; }
+    .form-card h2 { font-size: 1rem; font-weight: 600; color: #94a3b8; margin-bottom: 18px; text-transform: uppercase; letter-spacing: 0.05em; }
+    .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
+    .form-row-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; margin-bottom: 16px; }
+    label { display: block; font-size: 0.82rem; color: #94a3b8; margin-bottom: 6px; }
+    input, select { width: 100%; padding: 10px 14px; background: #0f172a; border: 1px solid #334155; border-radius: 8px; color: #e2e8f0; font-size: 0.9rem; outline: none; transition: border-color 0.2s; }
+    input:focus, select:focus { border-color: #3b82f6; }
+    .btn { padding: 12px 28px; border: none; border-radius: 8px; font-size: 0.95rem; font-weight: 600; cursor: pointer; transition: all 0.2s; }
+    .btn-primary { background: linear-gradient(135deg, #2563eb, #7c3aed); color: white; }
+    .btn-primary:hover { opacity: 0.9; transform: translateY(-1px); }
+    .btn-primary:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
+    .btn-secondary { background: #334155; color: #94a3b8; margin-left: 12px; }
+    .btn-secondary:hover { background: #475569; }
+    .status-bar { padding: 12px 16px; border-radius: 8px; margin-bottom: 16px; font-size: 0.88rem; display: flex; align-items: center; gap: 10px; }
+    .status-idle    { background: #1e293b; border: 1px solid #334155; color: #64748b; }
+    .status-pending { background: #1e3a5f; border: 1px solid #3b82f6; color: #93c5fd; }
+    .status-success { background: #14532d; border: 1px solid #22c55e; color: #86efac; }
+    .status-error   { background: #450a0a; border: 1px solid #ef4444; color: #fca5a5; }
+    .status-abort   { background: #451a03; border: 1px solid #f97316; color: #fed7aa; }
+    .spinner { width: 16px; height: 16px; border: 2px solid currentColor; border-top-color: transparent; border-radius: 50%; animation: spin 0.8s linear infinite; display: inline-block; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+    th { background: #0f172a; padding: 10px 12px; text-align: left; color: #64748b; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; border-bottom: 1px solid #334155; }
+    td { padding: 10px 12px; border-bottom: 1px solid #1e293b; color: #cbd5e1; }
+    tr:hover td { background: #1e293b; }
+    .pill { padding: 2px 8px; border-radius: 99px; font-size: 0.75rem; font-weight: 600; }
+    .pill-success { background: #14532d; color: #86efac; }
+    .pill-abort   { background: #451a03; color: #fed7aa; }
+    .pill-pending { background: #1e3a5f; color: #93c5fd; }
+    .pill-failed  { background: #450a0a; color: #fca5a5; }
+    .hash { font-family: monospace; color: #a5f3fc; }
+    .empty-state { text-align: center; padding: 40px; color: #475569; }
+    .dir-badge { padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: 600; }
+    .dir-ab { background: #1d4ed8; color: #bfdbfe; }
+    .dir-ba { background: #6d28d9; color: #ddd6fe; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>AO4C Cross-Chain Lab</h1>
+    <div class="subtitle">AI-Augmented Optimistic Cross-Chain Concurrency Control — 雙向跨鏈交易實驗環境</div>
+  </header>
+  <div class="container">
+    <div class="grid2">
+      <div class="card">
+        <h2>Chain A <span class="badge badge-a">port 8545</span></h2>
+        <div class="info-row"><span class="label">BridgeNode 地址</span><span class="value" id="addrA">載入中...</span></div>
+        <div class="info-row"><span class="label">橋接餘額</span><span class="value balance" id="balA">—</span></div>
+        <div class="info-row"><span class="label">globalVersion</span><span class="value" id="verA">—</span></div>
+        <div class="info-row"><span class="label">nextSeqNo</span><span class="value" id="seqA">—</span></div>
+        <div class="info-row"><span class="label">帳號餘額</span><span class="value balance" id="accBalA">—</span></div>
+      </div>
+      <div class="card">
+        <h2>Chain B <span class="badge badge-b">port 8546</span></h2>
+        <div class="info-row"><span class="label">BridgeNode 地址</span><span class="value" id="addrB">載入中...</span></div>
+        <div class="info-row"><span class="label">橋接餘額</span><span class="value balance" id="balB">—</span></div>
+        <div class="info-row"><span class="label">globalVersion</span><span class="value" id="verB">—</span></div>
+        <div class="info-row"><span class="label">nextSeqNo</span><span class="value" id="seqB">—</span></div>
+        <div class="info-row"><span class="label">帳號餘額</span><span class="value balance" id="accBalB">—</span></div>
+      </div>
+    </div>
+
+    <div class="form-card">
+      <h2>發送跨鏈交易（三階段 OCC）</h2>
+      <div class="form-row-3">
+        <div>
+          <label>方向</label>
+          <select id="directionSelect" onchange="updateSelects()">
+            <option value="AB">Chain A → Chain B</option>
+            <option value="BA">Chain B → Chain A</option>
+          </select>
+        </div>
+        <div><label>發送帳號</label><select id="senderSelect"></select></div>
+        <div><label>接收帳號</label><select id="recipientSelect"></select></div>
+      </div>
+      <div class="form-row">
+        <div><label>金額 (ETH)</label><input type="number" id="amountInput" value="0.01" min="0.001" step="0.001" /></div>
+        <div style="display:flex; align-items:flex-end; gap:12px;">
+          <button class="btn btn-primary" id="sendBtn" onclick="sendTx()">Phase 1: Commit</button>
+          <button class="btn btn-secondary" onclick="refreshAll()">刷新</button>
+        </div>
+      </div>
+      <div class="status-bar status-idle" id="statusBar">
+        <span id="statusText">就緒，等待操作... (Phase 1 Commit → Phase 2 Reveal 自動執行)</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>交易記錄 <button class="btn btn-secondary" style="float:right;padding:6px 14px;font-size:0.8rem;" onclick="renderTable()">刷新</button></h2>
+      <div style="overflow-x:auto; margin-top:16px;">
+        <table>
+          <thead>
+            <tr><th>#</th><th>方向</th><th>SeqNo</th><th>狀態</th><th>發送</th><th>接收</th><th>金額</th><th>TxHash</th><th>時間</th></tr>
+          </thead>
+          <tbody id="txTableBody">
+            <tr><td colspan="9" class="empty-state">尚無交易記錄</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>

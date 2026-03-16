@@ -1,0 +1,19 @@
+# npm 依賴
+node_modules/
+
+# Hardhat 編譯產物
+artifacts/
+cache/
+
+# 部署後的合約地址（各環境需重新部署）
+build/
+
+# 執行期 log 和 PID 檔
+logs/
+
+# 壓測產出的 Excel 報表
+reports/
+
+# 環境變數（含敏感資訊，絕對不上傳）
+.env
+oracle/.env

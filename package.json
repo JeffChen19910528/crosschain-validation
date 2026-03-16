@@ -1,0 +1,24 @@
+{
+  "name": "ao4c-crosschain-lab",
+  "version": "1.0.0",
+  "scripts": {
+    "start:chains": "bash scripts/start-chains.sh",
+    "start:ui":    "bash scripts/start-ui.sh",
+    "stress-test": "bash scripts/auto-stress-test.sh",
+    "oracle":      "node oracle/oracle.js"
+  },
+  "dependencies": {
+    "axios":   "^1.6.0",
+    "dayjs":   "^1.11.10",
+    "dotenv":  "^16.3.1",
+    "exceljs": "^4.4.0",
+    "express": "^4.18.2",
+    "p-limit": "^3.1.0",
+    "web3":    "^4.3.0",
+    "ws":      "^8.16.0"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^4.0.0",
+    "hardhat": "^2.19.0"
+  }
+}

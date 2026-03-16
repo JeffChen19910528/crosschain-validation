@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(chmod:*)",
+      "Bash(npm install:*)",
+      "Bash(npx hardhat:*)",
+      "Bash(node:*)",
+      "Bash(bash scripts/start-chains.sh 2>&1)",
+      "Bash(bash scripts/status.sh 2>&1)"
+    ]
+  }
+}
