@@ -34,17 +34,18 @@ class ReportGenerator {
     // Sheet 2: 交易明細
     const s2 = workbook.addWorksheet("交易明細 Detail");
     s2.columns = [
-      { header: "#",        key: "index",     width: 8  },
-      { header: "方向",     key: "direction", width: 8  },
-      { header: "SeqNo",    key: "seqNo",     width: 10 },
-      { header: "時間戳",   key: "timestamp", width: 26 },
-      { header: "狀態",     key: "status",    width: 12 },
-      { header: "發送地址", key: "sender",    width: 44 },
-      { header: "接收地址", key: "recipient", width: 44 },
-      { header: "金額 ETH", key: "amount",    width: 14 },
-      { header: "延遲 ms",  key: "latency",   width: 12 },
-      { header: "TxHash",   key: "txHash",    width: 68 },
-      { header: "錯誤訊息", key: "error",     width: 50 },
+      { header: "#",           key: "index",     width: 8  },
+      { header: "方向",        key: "direction", width: 8  },
+      { header: "SeqNo",       key: "seqNo",     width: 10 },
+      { header: "時間戳",      key: "timestamp", width: 26 },
+      { header: "狀態",        key: "status",    width: 12 },
+      { header: "Gas (Gwei)",  key: "gasGwei",   width: 14 },
+      { header: "發送地址",    key: "sender",    width: 44 },
+      { header: "接收地址",    key: "recipient", width: 44 },
+      { header: "金額 ETH",    key: "amount",    width: 14 },
+      { header: "延遲 ms",     key: "latency",   width: 12 },
+      { header: "TxHash",      key: "txHash",    width: 68 },
+      { header: "錯誤訊息",    key: "error",     width: 50 },
     ];
     results.forEach(r => s2.addRow(r));
     this._styleHeader(s2);
@@ -79,6 +80,9 @@ class ReportGenerator {
       { header: "累計成功",           key: "cumSuccess",   width: 14 },
       { header: "累計總量",           key: "cumTotal",     width: 12 },
       { header: "累計 TPS",           key: "cumTps",       width: 12 },
+      { header: "Gas 最小 (Gwei)",    key: "minGas",       width: 16 },
+      { header: "Gas 最大 (Gwei)",    key: "maxGas",       width: 16 },
+      { header: "Gas 平均 (Gwei)",    key: "avgGas",       width: 16 },
     ];
     this._tpsByMinute(results).forEach(r => s4.addRow(r));
     this._styleHeader(s4);
@@ -150,10 +154,11 @@ class ReportGenerator {
     const buckets = {};
     results.forEach(r => {
       const min = Math.floor((new Date(r.timestamp).getTime() - t0) / 60000);
-      if (!buckets[min]) buckets[min] = { total: 0, success: 0, failed: 0 };
+      if (!buckets[min]) buckets[min] = { total: 0, success: 0, failed: 0, gasValues: [] };
       buckets[min].total++;
       if (r.status === "revealed") buckets[min].success++;
       else buckets[min].failed++;
+      if (r.gasGwei != null) buckets[min].gasValues.push(r.gasGwei);
     });
 
     let cumSuccess = 0, cumTotal = 0;
@@ -162,6 +167,10 @@ class ReportGenerator {
         cumSuccess += v.success;
         cumTotal   += v.total;
         const elapsed = (parseInt(min) + 1) * 60;
+        const gasVals = v.gasValues;
+        const minGas  = gasVals.length ? Math.min(...gasVals) : "—";
+        const maxGas  = gasVals.length ? Math.max(...gasVals) : "—";
+        const avgGas  = gasVals.length ? (gasVals.reduce((s, g) => s + g, 0) / gasVals.length).toFixed(1) : "—";
         return {
           minute:     parseInt(min) + 1,
           clock:      `${String(parseInt(min)).padStart(2,"0")}:00`,
@@ -172,6 +181,9 @@ class ReportGenerator {
           cumSuccess,
           cumTotal,
           cumTps:     (cumSuccess / elapsed).toFixed(3),
+          minGas,
+          maxGas,
+          avgGas,
         };
       });
   }
