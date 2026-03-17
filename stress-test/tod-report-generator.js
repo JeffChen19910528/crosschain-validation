@@ -28,15 +28,28 @@ class TodReportGenerator {
     // ── Sheet 1：摘要 ──────────────────────────────────────────────
     const s1 = workbook.addWorksheet("摘要 Summary");
     s1.columns = [{ header: "項目", key: "key", width: 45 }, { header: "數值", key: "value", width: 30 }];
+    const durationSec  = summary.durationMs ? (summary.durationMs / 1000).toFixed(1) : "—";
+    const totalSent    = summary.totalSent    ?? ok.length;
+    const successCount = summary.successCount ?? ok.length;
+    const failCount    = summary.failCount    ?? 0;
+    const successRate  = totalSent > 0 ? ((successCount / totalSent) * 100).toFixed(1) + "%" : "—";
     s1.addRows([
       { key: "實驗名稱",                         value: "AO4C TOD Protection Experiment" },
       { key: "演算法",                            value: "AO4C (AI-Augmented Optimistic Cross-Chain CC)" },
       { key: "實驗時間",                          value: dayjs().format("YYYY-MM-DD HH:mm:ss") },
       { key: "交易方向",                          value: summary.direction },
       { key: "每輪批次大小（同時送出）",          value: summary.batch },
-      { key: "實驗輪數",                          value: summary.rounds },
+      { key: "衝突率設定（Conflict Rate）",        value: summary.conflictRate != null ? (summary.conflictRate * 100).toFixed(0) + "%" : "—" },
+      { key: "實驗輪數（批次數）",               value: summary.rounds },
+      { key: "實驗時長 (秒)",                     value: durationSec },
+      { key: "─────────────────────────────",   value: "─────────────────────" },
+      { key: "總送出筆數（Phase 1+2）",          value: totalSent },
+      { key: "Phase 1+2 成功筆數",               value: successCount },
+      { key: "Phase 1+2 失敗筆數",               value: failCount },
+      { key: "成功率",                            value: successRate },
+      { key: "吞吐量 TPS（Phase 1+2）",          value: summary.tps != null ? summary.tps.toFixed(3) : "—" },
       { key: "每筆金額 (ETH)",                   value: summary.amount },
-      { key: "有效交易數",                        value: ok.length },
+      { key: "有效 seqNo 交易數",                value: ok.length },
       { key: "─────────────────────────────",   value: "─────────────────────" },
       { key: "Spearman(gasPrice, seqNo)",        value: spearmanGasSeq.toFixed(6) },
       { key: "Spearman(gasPrice, txIndex)",      value: spearmanGasTx.toFixed(6) },
@@ -47,7 +60,7 @@ class TodReportGenerator {
     ]);
     this._styleHeader(s1);
 
-    const conclusionRow = s1.getRow(14);
+    const conclusionRow = s1.getRow(23);
     conclusionRow.getCell("value").font = { bold: true };
     conclusionRow.getCell("value").fill = {
       type: "pattern", pattern: "solid",
@@ -192,6 +205,50 @@ class TodReportGenerator {
     const noteRow5 = s5.addRow({ round: "※ 折線圖建議", batch: "選取「輪次」+「成功交易數」+「ρ(gasPrice,seqNo)」插入折線圖" });
     noteRow5.font = { italic: true, color: { argb: "FF888888" } };
 
+    // ── Sheet 6：每分鐘吞吐量 ─────────────────────────────────────
+    const s6 = workbook.addWorksheet("每分鐘吞吐量");
+    s6.columns = [
+      { header: "分鐘",             key: "minute",    width: 8  },
+      { header: "送出筆數",         key: "sent",      width: 10 },
+      { header: "成功筆數",         key: "success",   width: 10 },
+      { header: "失敗筆數",         key: "fail",      width: 10 },
+      { header: "成功率 (%)",       key: "rate",      width: 12 },
+      { header: "每分鐘 TPS",       key: "tpm",       width: 12 },
+      { header: "累計成功筆數",     key: "cumSuccess",width: 14 },
+      { header: "累計 TPS",         key: "cumTps",    width: 12 },
+    ];
+    if (ok.length > 0 && ok[0].timestamp) {
+      const experimentStart = Math.min(...results.map(r => r.timestamp || Infinity));
+      const byMinute = {};
+      results.forEach(r => {
+        if (!r.timestamp) return;
+        const m = Math.floor((r.timestamp - experimentStart) / 60000);
+        if (!byMinute[m]) byMinute[m] = { sent: 0, success: 0, fail: 0 };
+        byMinute[m].sent++;
+        if (r.revealStatus === "ok") byMinute[m].success++;
+        else byMinute[m].fail++;
+      });
+      let cumSuccess = 0;
+      Object.keys(byMinute).sort((a,b) => a-b).forEach(m => {
+        const d = byMinute[m];
+        cumSuccess += d.success;
+        const elapsed = (parseInt(m) + 1) * 60;
+        s6.addRow({
+          minute:     parseInt(m) + 1,
+          sent:       d.sent,
+          success:    d.success,
+          fail:       d.fail,
+          rate:       d.sent > 0 ? ((d.success / d.sent) * 100).toFixed(1) : "0",
+          tpm:        (d.success / 60).toFixed(3),
+          cumSuccess,
+          cumTps:     (cumSuccess / elapsed).toFixed(3),
+        });
+      });
+    } else {
+      s6.addRow({ minute: "※", sent: "無 timestamp 資料（舊版結果）" });
+    }
+    this._styleHeader(s6);
+
     fs.mkdirSync(summary.reportDir, { recursive: true });
     const filename = `ao4c-tod-experiment-${dayjs().format("YYYYMMDD-HHmmss")}.xlsx`;
     const filepath = path.join(summary.reportDir, filename);
@@ -211,8 +268,9 @@ class TodReportGenerator {
   }
 
   _getRanks(arr, descending = false) {
-    const sorted = [...arr].sort((a, b) => descending ? b - a : a - b);
-    return arr.map(v => sorted.indexOf(v) + 1);
+    const nums = arr.map(v => Number(v));
+    const sorted = [...nums].sort((a, b) => descending ? b - a : a - b);
+    return nums.map(v => sorted.indexOf(v) + 1);
   }
 
   _styleHeader(sheet) {

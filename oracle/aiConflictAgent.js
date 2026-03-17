@@ -13,7 +13,7 @@ const { execFile }  = require("child_process");
 const { promisify } = require("util");
 const execFileAsync = promisify(execFile);
 
-const TIMEOUT_MS = 20000;
+const TIMEOUT_MS = 60000;
 
 /**
  * @param {object[]} orderedBatch - 已按 seqNo 排序的交易陣列

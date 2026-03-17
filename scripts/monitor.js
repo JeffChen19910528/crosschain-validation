@@ -33,8 +33,6 @@ function printStats() {
     `Aborted:${C.red}${stats.aborted}${C.reset} ` +
     `Pending:${C.purple}${stats.pending}${C.reset} ` +
     `TPS:${C.cyan}${tps}${C.reset} ` +
-    `AI批次:${C.yellow}${aiStats.batches}${C.reset} ` +
-    `AI衝突:${C.red}${aiStats.aiAborts}${C.reset} ` +
     `Time:${C.dim}${elapsed}s${C.reset}   `
   );
 }

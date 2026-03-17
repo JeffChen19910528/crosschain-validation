@@ -12,7 +12,7 @@ const { askClaudeConflict } = require("./aiConflictAgent");
 const fs   = require("fs");
 const path = require("path");
 
-const BATCH_WINDOW_MS = 300;
+const BATCH_WINDOW_MS = 1500; // 等待同輪 reveal 全部到齊（Hardhat 逐筆出塊約需 500~1000ms）
 const AI_LOG = path.join(__dirname, "../logs/ai-decisions.jsonl");
 
 function writeAiLog(entry) {
