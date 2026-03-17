@@ -6,13 +6,13 @@
 
 ---
 
-## 論文架構說明
+## 架構說明
 
 ### 解決的問題
 
 | 問題 | 機制 | 實作位置 |
 |------|------|----------|
-| TOD（Transaction Ordering Dependence） | 確定性排序承諾（seqNo = nextSeqNo++，EVM 執行序決定，非礦工） | `BridgeNode.revealOrder()` |
+| TOD（Transaction Ordering Dependence） | 確定性排序承諾（seqNo = nextSeqNo++，EVM 執行序決定，非礦工）；壓測以隨機 gasPrice（1~100 Gwei）模擬礦工排序偏好，驗證 seqNo 與 gasPrice 無相關 | `BridgeNode.revealOrder()` / `stress-test/sender.js` |
 | Front-Running | Commit-Reveal：Phase 1 只送 `hash(amount+salt)`，Phase 2 才 reveal | `BridgeNode.commitOrder()` / `revealOrder()` |
 | 雙花攻擊（Double Spend） | `processedRequests` mapping + OCC version stamp + AI 語意判斷三層防護 | `BridgeNode.validateAndExecute()` |
 | ACID Isolation | `globalVersion` 序列化點 + `require(globalVersion == expectedVersion)` | `BridgeNode.validateAndExecute()` |
@@ -53,6 +53,7 @@ Phase 3 — AI Validation & Execution
 │  Oracle 中繼層（oracle/oracle.js）                   │
 │  · 輕量中繼，不做排序不做判斷                        │
 │  · 監聽雙鏈事件 → 呼叫 AI Agent → 帶結果回合約      │
+│  · AI 判定結果寫入 logs/ai-decisions.jsonl           │
 ├─────────────────────────────────────────────────────┤
 │  AI Agent 層（oracle/aiConflictAgent.js）            │
 │  · Claude Code CLI（月訂閱）                         │
@@ -149,12 +150,21 @@ bash scripts/auto-stress-test.sh 60 10 0.001
 bash scripts/auto-stress-test.sh
 ```
 
+每筆交易使用 **1~100 Gwei 之間的隨機 gasPrice**，用以模擬礦工依 gas 優先排序的 TOD 場景。測試完成後可在報表中驗證 seqNo 與 gasPrice 是否獨立（即 AO4C 的 TOD 防護是否成立）。
+
 測試完成後，Excel 報表自動儲存至 `reports/` 目錄，包含：
-- **摘要 Summary**：TPS、延遲統計（P50/P95/P99）、OCC Abort 數量
-- **交易明細 Detail**：每筆交易的 seqNo、狀態、方向、延遲
-- **每秒 TPS**：逐秒吞吐量
-- **每分鐘 TPS（折線圖）**：每分鐘成功交易數、平均 TPS、累計 TPS
-- **方向統計 Direction**：A→B 與 B→A 各自的成功率
+
+| 工作表 | 內容 |
+|--------|------|
+| **摘要 Summary** | TPS、延遲統計（P50/P95/P99）、OCC Abort 數量 |
+| **交易明細 Detail** | 每筆交易的 seqNo、狀態、方向、延遲、**Gas (Gwei)** |
+| **每秒 TPS** | 逐秒吞吐量 |
+| **每分鐘 TPS（折線圖）** | 每分鐘成功交易數、平均 TPS、累計 TPS、**Gas 最小/最大/平均 (Gwei)** |
+| **方向統計 Direction** | A→B 與 B→A 各自的成功率 |
+
+### Gas 欄位說明（TOD 驗證用）
+
+「交易明細」的 `Gas (Gwei)` 欄位與「每分鐘 TPS」的 Gas 統計欄位，記錄每筆 / 每分鐘交易實際送出的 gasPrice。若每分鐘的 Gas 最小值與最大值差距明顯（例如 1 Gwei vs 100 Gwei），代表 TOD 場景有效模擬，可搭配 TOD 實驗的 Spearman 分析進一步確認 seqNo 獨立性。
 
 ---
 
@@ -183,13 +193,34 @@ Spearman(gasPrice, seqNo) = ρ
 
 ## 即時監控說明
 
+`bash scripts/monitor.sh` 啟動後同時監控兩個來源：
+
+### 區塊鏈事件（Phase 2 / 3）
+
 ```
 [A REVEAL ] seqNo=5 from=0xabc...  0.0010 ETH →chainB   ← Phase 2 完成
 [B COMMIT ] seqNo=5 →0xdef...      0.0010 ETH ver=12     ← Phase 3 Commit
 [A ABORT  ] seqNo=7 refund→0xabc   0.0010 ETH reason=... ← Phase 3 Abort
-
-統計列：Revealed:N  Committed:N  Aborted:N  Pending:N  TPS:N.NNN
 ```
+
+### AI Agent 衝突判定
+
+```
+[AI▶ START] 批次大小=3 seqNos=[5, 6, 7]          ← 送給 Claude CLI 前
+[AI✔ DONE ] 耗時=1234ms commit=2 abort=1 ...      ← Claude 判定完成
+[AI✘ ERROR] 耗時=20001ms err=claude CLI failed ... ← CLI 呼叫失敗（保守全commit）
+[AI- SKIP ] 單筆交易(seqNo=8) 不需 AI 判斷        ← 單筆直接 commit
+```
+
+### 統計列
+
+```
+[統計] Revealed:N  Committed:N  Aborted:N  Pending:N  TPS:N.NNN  AI批次:N  AI衝突:N  Time:Ns
+```
+
+### AI 判定日誌
+
+Oracle 將每次 AI 判定結果寫入 `logs/ai-decisions.jsonl`（JSON Lines 格式），monitor 每秒輪詢此檔案並即時顯示。每次執行 `monitor.sh` 會自動清除舊日誌。
 
 ---
 
@@ -210,7 +241,7 @@ crosschain/
 │   └── BridgeNode.sol          # AO4C 核心合約（雙向對稱）
 ├── oracle/
 │   ├── oracle.js               # 雙向 Oracle 中繼
-│   ├── occExecutor.js          # OCC 批次執行器
+│   ├── occExecutor.js          # OCC 批次執行器（寫入 AI 判定日誌）
 │   ├── aiConflictAgent.js      # Claude Code CLI AI Agent
 │   └── .env
 ├── ui/
@@ -222,17 +253,21 @@ crosschain/
 │   ├── start-chains.sh
 │   ├── start-ui.sh
 │   ├── auto-stress-test.sh
-│   ├── monitor.sh / monitor.js
+│   ├── monitor.sh              # 啟動監控（清除舊 AI 日誌）
+│   ├── monitor.js              # 即時監控（區塊鏈事件 + AI Agent 判定）
 │   ├── run-tod-test.sh
 │   ├── status.sh
 │   └── check-env.sh
 ├── stress-test/
-│   ├── sender.js               # 雙向併發壓測
-│   ├── report-generator.js     # Excel 報表
+│   ├── sender.js               # 雙向併發壓測（隨機 gasPrice 模擬 TOD）
+│   ├── report-generator.js     # Excel 報表（含 Gas 欄位）
 │   ├── tod-test.js             # TOD 防護實驗
 │   └── tod-report-generator.js # TOD Excel 報表
 ├── build/                      # 部署後合約 artifact
-├── logs/                       # 執行期間 log
+├── logs/
+│   ├── chainA.log / chainB.log # Hardhat 節點 log
+│   ├── oracle.log              # Oracle 執行 log
+│   └── ai-decisions.jsonl      # AI Agent 判定記錄（每次監控啟動清除）
 ├── reports/                    # Excel 壓測報表
 └── README.md
 ```
@@ -245,7 +280,12 @@ crosschain/
 A：檢查 Oracle log（`logs/oracle.log`），確認 Claude Code CLI 是否正常回應。
 執行 `claude --output-format json -p "test"` 驗證 CLI 可用。
 
-**Q：Oracle log 出現 `AI agent unavailable`？**
+**Q：監控看不到 `[AI▶ START]` / `[AI✔ DONE]` 訊息？**
+A：AI 判定只在批次大小 > 1 時觸發。單筆交易顯示 `[AI- SKIP]`。
+若完全沒有 AI 相關訊息，請確認 Oracle 正在執行（`bash scripts/status.sh`）
+並確認 `logs/ai-decisions.jsonl` 存在且有內容。
+
+**Q：Oracle log 出現 `AI agent unavailable` 或監控顯示 `[AI✘ ERROR]`？**
 A：Claude Code CLI 回應逾時或失敗，此時 OCC 保守處理為全部 commit，
 最後由合約的 version 驗證攔截真正的衝突。
 
@@ -257,7 +297,3 @@ A：通常是 Hardhat 本地鏈的 gas 或 nonce 問題。降低併發數：
 A：請先執行 `bash scripts/start-chains.sh`，確認 `build/` 目錄有 `BridgeNode.json`。
 
 ---
-
-## 授權
-
-MIT License

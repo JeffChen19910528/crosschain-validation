@@ -66,31 +66,36 @@ async function main() {
         { type: "bytes32", value: salt }
       );
 
+      // 隨機 gasPrice（1~100 Gwei）：模擬礦工依 gas 排序的 TOD 場景
+      // seqNo 應與 gasPrice 無關，以驗證 AO4C 的 TOD 防護能力
+      const gasGwei    = Math.floor(Math.random() * 100) + 1;
+      const gasPrice   = srcWeb3.utils.toWei(gasGwei.toString(), "gwei");
+
       try {
         // Phase 1
         const tx1 = await srcNode.methods
           .commitOrder(blindedAmount, recipient, dstChainId)
-          .send({ from: sender, value: amount, gas: 200000 });
+          .send({ from: sender, value: amount, gas: 200000, gasPrice });
         const requestId = tx1.events?.OrderCommitted?.returnValues?.requestId;
 
         // Phase 2
         const tx2 = await srcNode.methods
           .revealOrder(requestId, amount, salt)
-          .send({ from: sender, gas: 200000 });
+          .send({ from: sender, gas: 200000, gasPrice });
         const seqNo = tx2.events?.OrderRevealed?.returnValues?.seqNo;
 
         const latency = Date.now() - t0;
         successCount++;
-        results.push({ index: idx, direction, status: "revealed", seqNo: seqNo?.toString(), txHash: tx2.transactionHash, sender, recipient, amount: AMOUNT_ETH, latency, timestamp: new Date(t0).toISOString() });
+        results.push({ index: idx, direction, status: "revealed", seqNo: seqNo?.toString(), txHash: tx2.transactionHash, sender, recipient, amount: AMOUNT_ETH, latency, gasGwei, timestamp: new Date(t0).toISOString() });
 
         if (idx % 20 === 0) {
           const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
           const tps = (successCount / parseFloat(elapsed)).toFixed(2);
-          console.log(`[Stress] tx=${String(idx).padStart(4)} revealed=${String(successCount).padStart(4)} fail=${String(failCount).padStart(3)} elapsed=${elapsed}s tps=${tps}`);
+          console.log(`[Stress] tx=${String(idx).padStart(4)} revealed=${String(successCount).padStart(4)} fail=${String(failCount).padStart(3)} elapsed=${elapsed}s tps=${tps} gas=${gasGwei}Gwei`);
         }
       } catch (err) {
         failCount++;
-        results.push({ index: idx, direction, status: "failed", error: err.message.slice(0, 200), sender, recipient, amount: AMOUNT_ETH, latency: Date.now() - t0, timestamp: new Date(t0).toISOString() });
+        results.push({ index: idx, direction, status: "failed", error: err.message.slice(0, 200), sender, recipient, amount: AMOUNT_ETH, latency: Date.now() - t0, gasGwei, timestamp: new Date(t0).toISOString() });
       }
     });
 
