@@ -2,7 +2,7 @@
  * tod-test.js — AO4C TOD（Transaction Ordering Dependence）實驗
  *
  * 實驗設計：
- *  1. 同時（Promise.all）送出 BATCH_SIZE 筆交易，gasPrice 各不相同
+ *  1. 同時（Promise.all）送出 BATCH_SIZE 筆交易，gasPrice 各不相同（5~200 Gwei 隨機）
  *     → 模擬攻擊者試圖透過 gasPrice 操控礦工排序
  *  2. 記錄三個序號：
  *     - gasPrice  : 攻擊者期望的優先順序（高 gas = 期望先執行）
@@ -10,10 +10,22 @@
  *     - seqNo     : AO4C 確定性排序（BridgeNode.revealOrder 賦予）
  *  3. 分析 txIndex 與 seqNo 的相關性
  *     - 若相關性低 → 礦工排序 ≠ AO4C 排序 → TOD 攻擊對 AO4C 無效
- *  4. 產出 Excel 報表，含三欄對比和 Spearman 相關係數
+ *  4. 產出 Excel 報表，含三欄對比、Spearman 相關係數、TPS 吞吐量
  *
  * 使用方式：
- *  node stress-test/tod-test.js [--batch 10] [--rounds 5] [--amount 0.001] [--direction AB]
+ *  node stress-test/tod-test.js --batch 10 --duration 600 --direction AB
+ *  node stress-test/tod-test.js --batch 10 --duration 600 --conflict-rate 0.3
+ *
+ * 參數說明：
+ *  --batch N           每輪同時送出交易數（預設 10）
+ *  --rounds N          輪數上限（與 --duration 二選一，預設 5）
+ *  --duration N        持續秒數（例如 600 = 10 分鐘）
+ *  --conflict-rate 0~1 每筆交易複用已出現 sender 的機率（預設 0.3）
+ *                      0.0 = 全不衝突（每筆 sender 唯一）
+ *                      0.3 = 約 30% 交易會觸發 double-spend 衝突（符合現實）
+ *                      1.0 = 全部衝突（所有交易用同一個 sender）
+ *  --amount ETH        每筆金額（預設 0.001）
+ *  --direction         AB 或 BA（預設 AB）
  */
 require("dotenv").config({ path: __dirname + "/../oracle/.env" });
 const { Web3 }        = require("web3");
@@ -24,19 +36,30 @@ const path            = require("path");
 const CHAIN_A_URL = process.env.CHAIN_A_URL || "http://127.0.0.1:8545";
 const CHAIN_B_URL = process.env.CHAIN_B_URL || "http://127.0.0.1:8546";
 
-const args      = parseArgs(process.argv.slice(2));
-const BATCH     = parseInt(args.batch     || "10");
-const ROUNDS    = parseInt(args.rounds    || "5");
-const AMOUNT    = args.amount    || "0.001";
-const DIRECTION = args.direction || "AB";
-const REPORT_DIR = args["report-dir"] || "./reports";
+const args          = parseArgs(process.argv.slice(2));
+const BATCH         = parseInt(args.batch     || "10");
+const DURATION_MS   = args.duration ? parseInt(args.duration) * 1000 : null;
+const ROUNDS        = DURATION_MS ? Infinity : parseInt(args.rounds || "5");
+const AMOUNT        = args.amount    || "0.001";
+const DIRECTION     = args.direction || "AB";
+const REPORT_DIR    = args["report-dir"] || "./reports";
+// 每筆交易複用批次內已出現 sender 的機率（0=無衝突, 0.3=30%衝突, 1=全衝突）
+const CONFLICT_RATE = args["conflict-rate"] != null ? parseFloat(args["conflict-rate"]) : 0.3;
 
-// gasPrice 梯度：從高到低，模擬攻擊者賦予不同優先序
+// gasPrice 隨機分佈：在 [MIN_GWEI, MAX_GWEI] 區間隨機取值，模擬真實 TOD 攻擊情境
+const MIN_GWEI = 5;
+const MAX_GWEI = 200;
 function buildGasPrices(batchSize) {
-  const base = 10; // gwei base
-  return Array.from({ length: batchSize }, (_, i) =>
-    ((batchSize - i) * base).toString() + "000000000"
-  );
+  // 先產生不重複的隨機整數 Gwei 值（避免同值影響 Spearman rank）
+  const used = new Set();
+  return Array.from({ length: batchSize }, () => {
+    let gwei;
+    do {
+      gwei = Math.floor(Math.random() * (MAX_GWEI - MIN_GWEI + 1)) + MIN_GWEI;
+    } while (used.has(gwei) && used.size < (MAX_GWEI - MIN_GWEI + 1));
+    used.add(gwei);
+    return (gwei * 1e9).toString();
+  });
 }
 
 async function main() {
@@ -58,44 +81,86 @@ async function main() {
 
   console.log("==========================================");
   console.log(" AO4C TOD Experiment");
-  console.log(`  Direction : ${DIRECTION}`);
-  console.log(`  Batch size: ${BATCH} tx/round`);
-  console.log(`  Rounds    : ${ROUNDS}`);
-  console.log(`  Amount    : ${AMOUNT} ETH/tx`);
+  console.log(`  Direction  : ${DIRECTION}`);
+  console.log(`  Batch size : ${BATCH} tx/round`);
+  console.log(`  Mode          : ${DURATION_MS ? `TIME ${DURATION_MS/1000}s` : `ROUNDS ${ROUNDS}`}`);
+  console.log(`  Conflict rate : ${(CONFLICT_RATE * 100).toFixed(0)}% (${CONFLICT_RATE === 0 ? "無衝突" : CONFLICT_RATE >= 1 ? "全衝突" : "隨機衝突"})`);
+  console.log(`  Amount        : ${AMOUNT} ETH/tx`);
   console.log("==========================================\n");
 
   const allRoundResults = [];
+  const startTime       = Date.now();
+  let   round           = 0;
+  let   successCount    = 0;
+  let   failCount       = 0;
+  let   totalSent       = 0;
 
-  for (let round = 0; round < ROUNDS; round++) {
-    console.log(`\n[TOD] === Round ${round + 1} / ${ROUNDS} ===`);
+  const shouldContinue = () =>
+    DURATION_MS ? (Date.now() - startTime) < DURATION_MS : round < ROUNDS;
+
+  while (shouldContinue()) {
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(0);
+    const label   = DURATION_MS
+      ? `Round ${round + 1} (${elapsed}s / ${DURATION_MS/1000}s)`
+      : `Round ${round + 1} / ${ROUNDS}`;
+    console.log(`\n[TOD] === ${label} ===`);
+
     const roundResults = await runRound(round, srcNode, srcWeb3, accounts, dstAccs, dstChainId);
     allRoundResults.push(...roundResults);
+    const roundOk   = roundResults.filter(r => r.revealStatus === "ok").length;
+    const roundFail = roundResults.filter(r => r.revealStatus !== "ok").length;
+    successCount += roundOk;
+    failCount    += roundFail;
+    totalSent    += roundResults.length;
     analyzeRound(round + 1, roundResults);
+    round++;
 
-    if (round < ROUNDS - 1) await sleep(2000);
+    if (shouldContinue()) await sleep(2000);
   }
+
+  const totalMs  = Date.now() - startTime;
+  const tps      = (successCount / (totalMs / 1000)).toFixed(3);
 
   console.log("\n[TOD] === Overall Analysis ===");
   analyzeOverall(allRoundResults);
+  console.log(`\nThroughput : ${tps} TPS (${successCount} tx / ${(totalMs/1000).toFixed(1)}s)`);
 
   const gen = new TodReportGenerator();
   await gen.generate(allRoundResults, {
-    batch: BATCH, rounds: ROUNDS, amount: AMOUNT,
+    batch: BATCH, rounds: round, amount: AMOUNT,
     direction: DIRECTION, reportDir: REPORT_DIR,
+    durationMs: totalMs, tps: parseFloat(tps),
+    conflictRate: CONFLICT_RATE,
+    totalSent, successCount, failCount,
   });
 
   process.exit(0);
 }
 
 async function runRound(roundIdx, srcNode, srcWeb3, accounts, dstAccs, dstChainId) {
-  const gasPrices = buildGasPrices(BATCH);
-  const amount    = srcWeb3.utils.toWei(AMOUNT, "ether");
-  const recipient = dstAccs[0];
+  const gasPrices  = buildGasPrices(BATCH);
+  const amount     = srcWeb3.utils.toWei(AMOUNT, "ether");
+  const recipient  = dstAccs[0];
+  const roundStart = Date.now();
 
-  console.log(`[TOD] Preparing ${BATCH} tx with gasPrice: ${gasPrices.map(g => parseInt(g)/1e9 + "Gwei").join(", ")}`);
+  const gasPricesSorted = [...gasPrices].map(g => parseInt(g)/1e9).sort((a,b)=>a-b);
+  console.log(`[TOD] Preparing ${BATCH} tx with random gasPrice range: ${gasPricesSorted[0]}~${gasPricesSorted[gasPricesSorted.length-1]} Gwei`);
 
+  // 依 CONFLICT_RATE 隨機決定每筆是否複用已出現的 sender
+  const usedSenders = [];
   const txMeta = Array.from({ length: BATCH }, (_, i) => {
-    const sender        = accounts[i % accounts.length];
+    let sender;
+    if (usedSenders.length > 0 && Math.random() < CONFLICT_RATE) {
+      // 複用批次內已出現的 sender → 製造 double-spend 衝突
+      sender = usedSenders[Math.floor(Math.random() * usedSenders.length)];
+    } else {
+      // 挑一個批次內尚未出現的 sender
+      const fresh = accounts.filter(a => !usedSenders.includes(a));
+      sender = fresh.length > 0
+        ? fresh[Math.floor(Math.random() * fresh.length)]
+        : accounts[Math.floor(Math.random() * accounts.length)];
+      usedSenders.push(sender);
+    }
     const salt          = srcWeb3.utils.randomHex(32);
     const blindedAmount = srcWeb3.utils.soliditySha3(
       { type: "uint256", value: amount },
@@ -103,6 +168,8 @@ async function runRound(roundIdx, srcNode, srcWeb3, accounts, dstAccs, dstChainI
     );
     return { i, sender, salt, blindedAmount, gasPrice: gasPrices[i], amount, recipient };
   });
+  const conflictCount = BATCH - usedSenders.length;
+  console.log(`[TOD] Conflict senders this round: ${conflictCount}/${BATCH} (rate=${(CONFLICT_RATE*100).toFixed(0)}%}`);
 
   console.log(`[TOD] Sending ${BATCH} commitOrder simultaneously...`);
   const commitResults = await Promise.all(txMeta.map(async (meta) => {
@@ -119,8 +186,8 @@ async function runRound(roundIdx, srcNode, srcWeb3, accounts, dstAccs, dstChainI
         ...meta,
         requestId:    tx.events?.OrderCommitted?.returnValues?.requestId,
         commitTxHash: tx.transactionHash,
-        commitBlock:  tx.blockNumber,
-        commitTxIndex: tx.transactionIndex,
+        commitBlock:  Number(tx.blockNumber),
+        commitTxIndex: Number(tx.transactionIndex),
         commitStatus: "ok",
       };
     } catch (err) {
@@ -145,15 +212,16 @@ async function runRound(roundIdx, srcNode, srcWeb3, accounts, dstAccs, dstChainI
       const seqNo = tx.events?.OrderRevealed?.returnValues?.seqNo;
       return {
         ...meta,
-        seqNo:         seqNo ? parseInt(seqNo) : null,
+        seqNo:         seqNo != null ? Number(seqNo) : null,
         revealTxHash:  tx.transactionHash,
-        revealBlock:   tx.blockNumber,
-        revealTxIndex: tx.transactionIndex,
+        revealBlock:   Number(tx.blockNumber),
+        revealTxIndex: Number(tx.transactionIndex),
         revealStatus:  "ok",
         round:         roundIdx + 1,
+        timestamp:     roundStart,
       };
     } catch (err) {
-      return { ...meta, revealStatus: "failed", error: err.message.slice(0, 100), round: roundIdx + 1 };
+      return { ...meta, revealStatus: "failed", error: err.message.slice(0, 100), round: roundIdx + 1, timestamp: roundStart };
     }
   }));
 
