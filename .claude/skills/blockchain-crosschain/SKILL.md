@@ -602,16 +602,35 @@ CHAIN_B_URL=http://127.0.0.1:8546
 ### oracle/occExecutor.js
 
 ```javascript
+/**
+ * occExecutor.js — OCC 批次執行器（輕量版）
+ *
+ * Oracle 層只負責：
+ *  1. 收集 OrderRevealed 事件
+ *  2. 在批次視窗結束後，帶有序序列呼叫 AI Agent
+ *  3. 把 AI 結果帶回合約執行
+ *
+ * 排序邏輯已在合約層完成（seqNo），此處只按 seqNo 排列後送 AI。
+ */
 const { askClaudeConflict } = require("./aiConflictAgent");
+const fs   = require("fs");
+const path = require("path");
 
-const BATCH_WINDOW_MS = 300;
+const BATCH_WINDOW_MS = 1500; // 等待同輪 reveal 全部到齊（Hardhat 逐筆出塊約需 500~1000ms）
+const AI_LOG = path.join(__dirname, "../logs/ai-decisions.jsonl");
+
+function writeAiLog(entry) {
+  try {
+    fs.appendFileSync(AI_LOG, JSON.stringify(entry) + "\n");
+  } catch (_) {}
+}
 
 class OccExecutor {
   constructor() {
     this.pendingBatch = [];
     this.batchTimer   = null;
-    this.onCommit     = null;
-    this.onAbort      = null;
+    this.onCommit     = null; // async (tx) => void
+    this.onAbort      = null; // async (tx, note) => void
   }
 
   submit(tx) {
@@ -629,17 +648,55 @@ class OccExecutor {
 
     console.log(`[OCC] === Validation Phase: ${batch.length} tx(s) ===`);
 
+    const batchStartTime = Date.now();
+    writeAiLog({
+      type: "batch_start",
+      time: batchStartTime,
+      size: batch.length,
+      seqNos: batch.map(t => Number(t.seqNo)),
+    });
+
     let commits = batch.map(t => t.requestId);
     let aborts  = {};
+    let aiInvoked = false;
+    let aiError   = null;
 
     if (batch.length > 1) {
+      aiInvoked = true;
       try {
+        // 送給 AI Agent 的序列已按 seqNo 排好（合約層確定性排序）
         const result = await askClaudeConflict(batch);
         commits = result.commits;
         result.aborts.forEach(a => { aborts[a.requestId] = a.note; });
+
+        writeAiLog({
+          type:       "ai_result",
+          time:       Date.now(),
+          elapsed_ms: Date.now() - batchStartTime,
+          batch_size: batch.length,
+          commits:    result.commits.length,
+          aborts:     result.aborts.length,
+          abort_details: result.aborts.map(a => ({ seqNo: batch.find(t => t.requestId === a.requestId)?.seqNo, note: a.note })),
+        });
       } catch (err) {
+        aiError = err.message;
         console.error("[OCC] AI Agent error:", err.message);
+        writeAiLog({
+          type:       "ai_error",
+          time:       Date.now(),
+          elapsed_ms: Date.now() - batchStartTime,
+          batch_size: batch.length,
+          error:      err.message.slice(0, 200),
+        });
+        // AI 失敗時保守處理：全部 commit（OCC 版本驗證作為最後防線）
       }
+    } else {
+      // 單筆交易不需 AI 判斷
+      writeAiLog({
+        type:       "single_tx_skip",
+        time:       Date.now(),
+        seqNo:      Number(batch[0].seqNo),
+      });
     }
 
     for (const tx of batch) {
@@ -662,11 +719,22 @@ module.exports = OccExecutor;
 ### oracle/aiConflictAgent.js
 
 ```javascript
+/**
+ * aiConflictAgent.js — Claude Code CLI AI 衝突驗證 Agent
+ *
+ * 接收已按 seqNo 排好序的交易批次（排序由合約層確定性決定）
+ * 判斷在此順序下哪些交易有語意衝突
+ * 回傳 { commits: [requestId,...], aborts: [{requestId, note},...] }
+ *
+ * 前提：
+ *   npm install -g @anthropic-ai/claude-code
+ *   claude  （完成登入）
+ */
 const { execFile }  = require("child_process");
 const { promisify } = require("util");
 const execFileAsync = promisify(execFile);
 
-const TIMEOUT_MS = 20000;
+const TIMEOUT_MS = 60000;
 
 async function askClaudeConflict(orderedBatch) {
   const prompt = buildPrompt(orderedBatch);
@@ -1507,29 +1575,36 @@ async function main() {
         { type: "bytes32", value: salt }
       );
 
+      // 隨機 gasPrice（1~100 Gwei）：模擬礦工依 gas 排序的 TOD 場景
+      // seqNo 應與 gasPrice 無關，以驗證 AO4C 的 TOD 防護能力
+      const gasGwei    = Math.floor(Math.random() * 100) + 1;
+      const gasPrice   = srcWeb3.utils.toWei(gasGwei.toString(), "gwei");
+
       try {
+        // Phase 1
         const tx1 = await srcNode.methods
           .commitOrder(blindedAmount, recipient, dstChainId)
-          .send({ from: sender, value: amount, gas: 200000 });
+          .send({ from: sender, value: amount, gas: 200000, gasPrice });
         const requestId = tx1.events?.OrderCommitted?.returnValues?.requestId;
 
+        // Phase 2
         const tx2 = await srcNode.methods
           .revealOrder(requestId, amount, salt)
-          .send({ from: sender, gas: 200000 });
+          .send({ from: sender, gas: 200000, gasPrice });
         const seqNo = tx2.events?.OrderRevealed?.returnValues?.seqNo;
 
         const latency = Date.now() - t0;
         successCount++;
-        results.push({ index: idx, direction, status: "revealed", seqNo: seqNo?.toString(), txHash: tx2.transactionHash, sender, recipient, amount: AMOUNT_ETH, latency, timestamp: new Date(t0).toISOString() });
+        results.push({ index: idx, direction, status: "revealed", seqNo: seqNo?.toString(), txHash: tx2.transactionHash, sender, recipient, amount: AMOUNT_ETH, latency, gasGwei, timestamp: new Date(t0).toISOString() });
 
         if (idx % 20 === 0) {
           const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
           const tps = (successCount / parseFloat(elapsed)).toFixed(2);
-          console.log(`[Stress] tx=${String(idx).padStart(4)} revealed=${String(successCount).padStart(4)} fail=${String(failCount).padStart(3)} elapsed=${elapsed}s tps=${tps}`);
+          console.log(`[Stress] tx=${String(idx).padStart(4)} revealed=${String(successCount).padStart(4)} fail=${String(failCount).padStart(3)} elapsed=${elapsed}s tps=${tps} gas=${gasGwei}Gwei`);
         }
       } catch (err) {
         failCount++;
-        results.push({ index: idx, direction, status: "failed", error: err.message.slice(0, 200), sender, recipient, amount: AMOUNT_ETH, latency: Date.now() - t0, timestamp: new Date(t0).toISOString() });
+        results.push({ index: idx, direction, status: "failed", error: err.message.slice(0, 200), sender, recipient, amount: AMOUNT_ETH, latency: Date.now() - t0, gasGwei, timestamp: new Date(t0).toISOString() });
       }
     });
 
@@ -1608,17 +1683,18 @@ class ReportGenerator {
 
     const s2 = workbook.addWorksheet("交易明細 Detail");
     s2.columns = [
-      { header: "#",        key: "index",     width: 8  },
-      { header: "方向",     key: "direction", width: 8  },
-      { header: "SeqNo",    key: "seqNo",     width: 10 },
-      { header: "時間戳",   key: "timestamp", width: 26 },
-      { header: "狀態",     key: "status",    width: 12 },
-      { header: "發送地址", key: "sender",    width: 44 },
-      { header: "接收地址", key: "recipient", width: 44 },
-      { header: "金額 ETH", key: "amount",    width: 14 },
-      { header: "延遲 ms",  key: "latency",   width: 12 },
-      { header: "TxHash",   key: "txHash",    width: 68 },
-      { header: "錯誤訊息", key: "error",     width: 50 },
+      { header: "#",           key: "index",     width: 8  },
+      { header: "方向",        key: "direction", width: 8  },
+      { header: "SeqNo",       key: "seqNo",     width: 10 },
+      { header: "時間戳",      key: "timestamp", width: 26 },
+      { header: "狀態",        key: "status",    width: 12 },
+      { header: "Gas (Gwei)",  key: "gasGwei",   width: 14 },
+      { header: "發送地址",    key: "sender",    width: 44 },
+      { header: "接收地址",    key: "recipient", width: 44 },
+      { header: "金額 ETH",    key: "amount",    width: 14 },
+      { header: "延遲 ms",     key: "latency",   width: 12 },
+      { header: "TxHash",      key: "txHash",    width: 68 },
+      { header: "錯誤訊息",    key: "error",     width: 50 },
     ];
     results.forEach(r => s2.addRow(r));
     this._styleHeader(s2);
@@ -1642,18 +1718,22 @@ class ReportGenerator {
 
     const s4 = workbook.addWorksheet("每分鐘 TPS（折線圖）");
     s4.columns = [
-      { header: "經過分鐘",           key: "minute",     width: 12 },
-      { header: "時間戳",             key: "clock",      width: 12 },
-      { header: "成功交易數",         key: "success",    width: 14 },
-      { header: "失敗交易數",         key: "failed",     width: 14 },
-      { header: "總交易數",           key: "total",      width: 12 },
-      { header: "平均 TPS（該分鐘）", key: "avgTps",     width: 18 },
-      { header: "累計成功",           key: "cumSuccess", width: 14 },
-      { header: "累計總量",           key: "cumTotal",   width: 12 },
-      { header: "累計 TPS",           key: "cumTps",     width: 12 },
+      { header: "經過分鐘",           key: "minute",       width: 12 },
+      { header: "時間戳",             key: "clock",        width: 12 },
+      { header: "成功交易數",         key: "success",      width: 14 },
+      { header: "失敗交易數",         key: "failed",       width: 14 },
+      { header: "總交易數",           key: "total",        width: 12 },
+      { header: "平均 TPS（該分鐘）", key: "avgTps",       width: 18 },
+      { header: "累計成功",           key: "cumSuccess",   width: 14 },
+      { header: "累計總量",           key: "cumTotal",     width: 12 },
+      { header: "累計 TPS",           key: "cumTps",       width: 12 },
+      { header: "Gas 最小 (Gwei)",    key: "minGas",       width: 16 },
+      { header: "Gas 最大 (Gwei)",    key: "maxGas",       width: 16 },
+      { header: "Gas 平均 (Gwei)",    key: "avgGas",       width: 16 },
     ];
     this._tpsByMinute(results).forEach(r => s4.addRow(r));
     this._styleHeader(s4);
+    s4.getRow(1).height = 22;
     const noteRow = s4.addRow({ minute: "※ 折線圖建議", clock: "選取「時間戳」+「平均TPS」欄位插入折線圖" });
     noteRow.font = { italic: true, color: { argb: "FF888888" } };
 
@@ -1712,17 +1792,37 @@ class ReportGenerator {
     const buckets = {};
     results.forEach(r => {
       const min = Math.floor((new Date(r.timestamp).getTime() - t0) / 60000);
-      if (!buckets[min]) buckets[min] = { total: 0, success: 0, failed: 0 };
+      if (!buckets[min]) buckets[min] = { total: 0, success: 0, failed: 0, gasValues: [] };
       buckets[min].total++;
       if (r.status === "revealed") buckets[min].success++;
       else buckets[min].failed++;
+      if (r.gasGwei != null) buckets[min].gasValues.push(r.gasGwei);
     });
+
     let cumSuccess = 0, cumTotal = 0;
     return Object.entries(buckets).sort(([a], [b]) => parseInt(a) - parseInt(b))
       .map(([min, v]) => {
-        cumSuccess += v.success; cumTotal += v.total;
+        cumSuccess += v.success;
+        cumTotal   += v.total;
         const elapsed = (parseInt(min) + 1) * 60;
-        return { minute: parseInt(min) + 1, clock: `${String(parseInt(min)).padStart(2,"0")}:00`, success: v.success, failed: v.failed, total: v.total, avgTps: (v.success / 60).toFixed(3), cumSuccess, cumTotal, cumTps: (cumSuccess / elapsed).toFixed(3) };
+        const gasVals = v.gasValues;
+        const minGas  = gasVals.length ? Math.min(...gasVals) : "—";
+        const maxGas  = gasVals.length ? Math.max(...gasVals) : "—";
+        const avgGas  = gasVals.length ? (gasVals.reduce((s, g) => s + g, 0) / gasVals.length).toFixed(1) : "—";
+        return {
+          minute:     parseInt(min) + 1,
+          clock:      `${String(parseInt(min)).padStart(2,"0")}:00`,
+          success:    v.success,
+          failed:     v.failed,
+          total:      v.total,
+          avgTps:     (v.success / 60).toFixed(3),
+          cumSuccess,
+          cumTotal,
+          cumTps:     (cumSuccess / elapsed).toFixed(3),
+          minGas,
+          maxGas,
+          avgGas,
+        };
       });
   }
   _secToHms(sec) {
@@ -1751,27 +1851,68 @@ module.exports = ReportGenerator;
 > **關鍵**：`dstChainId` 用邏輯 ID，不讀 `eth_chainId`。
 
 ```javascript
+/**
+ * tod-test.js — AO4C TOD（Transaction Ordering Dependence）實驗
+ *
+ * 實驗設計：
+ *  1. 同時（Promise.all）送出 BATCH_SIZE 筆交易，gasPrice 各不相同（5~200 Gwei 隨機）
+ *     → 模擬攻擊者試圖透過 gasPrice 操控礦工排序
+ *  2. 記錄三個序號：
+ *     - gasPrice  : 攻擊者期望的優先順序（高 gas = 期望先執行）
+ *     - txIndex   : 礦工實際排序（在區塊內的位置）
+ *     - seqNo     : AO4C 確定性排序（BridgeNode.revealOrder 賦予）
+ *  3. 分析 txIndex 與 seqNo 的相關性
+ *     - 若相關性低 → 礦工排序 ≠ AO4C 排序 → TOD 攻擊對 AO4C 無效
+ *  4. 產出 Excel 報表，含三欄對比、Spearman 相關係數、TPS 吞吐量
+ *
+ * 使用方式：
+ *  node stress-test/tod-test.js --batch 10 --duration 600 --direction AB
+ *  node stress-test/tod-test.js --batch 10 --duration 600 --conflict-rate 0.3
+ *
+ * 參數說明：
+ *  --batch N           每輪同時送出交易數（預設 10）
+ *  --rounds N          輪數上限（與 --duration 二選一，預設 5）
+ *  --duration N        持續秒數（例如 600 = 10 分鐘）
+ *  --conflict-rate 0~1 每筆交易複用已出現 sender 的機率（預設 0.3）
+ *                      0.0 = 全不衝突（每筆 sender 唯一）
+ *                      0.3 = 約 30% 交易會觸發 double-spend 衝突（符合現實）
+ *                      1.0 = 全部衝突（所有交易用同一個 sender）
+ *  --amount ETH        每筆金額（預設 0.001）
+ *  --direction         AB 或 BA（預設 AB）
+ */
 require("dotenv").config({ path: __dirname + "/../oracle/.env" });
-const { Web3 }           = require("web3");
+const { Web3 }        = require("web3");
 const TodReportGenerator = require("./tod-report-generator");
-const fs   = require("fs");
-const path = require("path");
+const fs              = require("fs");
+const path            = require("path");
 
 const CHAIN_A_URL = process.env.CHAIN_A_URL || "http://127.0.0.1:8545";
 const CHAIN_B_URL = process.env.CHAIN_B_URL || "http://127.0.0.1:8546";
 
-const args       = parseArgs(process.argv.slice(2));
-const BATCH      = parseInt(args.batch     || "10");
-const ROUNDS     = parseInt(args.rounds    || "5");
-const AMOUNT     = args.amount    || "0.001";
-const DIRECTION  = args.direction || "AB";
-const REPORT_DIR = args["report-dir"] || "./reports";
+const args          = parseArgs(process.argv.slice(2));
+const BATCH         = parseInt(args.batch     || "10");
+const DURATION_MS   = args.duration ? parseInt(args.duration) * 1000 : null;
+const ROUNDS        = DURATION_MS ? Infinity : parseInt(args.rounds || "5");
+const AMOUNT        = args.amount    || "0.001";
+const DIRECTION     = args.direction || "AB";
+const REPORT_DIR    = args["report-dir"] || "./reports";
+// 每筆交易複用批次內已出現 sender 的機率（0=無衝突, 0.3=30%衝突, 1=全衝突）
+const CONFLICT_RATE = args["conflict-rate"] != null ? parseFloat(args["conflict-rate"]) : 0.3;
 
+// gasPrice 隨機分佈：在 [MIN_GWEI, MAX_GWEI] 區間隨機取值，模擬真實 TOD 攻擊情境
+const MIN_GWEI = 5;
+const MAX_GWEI = 200;
 function buildGasPrices(batchSize) {
-  const base = 10;
-  return Array.from({ length: batchSize }, (_, i) =>
-    ((batchSize - i) * base).toString() + "000000000"
-  );
+  // 先產生不重複的隨機整數 Gwei 值（避免同值影響 Spearman rank）
+  const used = new Set();
+  return Array.from({ length: batchSize }, () => {
+    let gwei;
+    do {
+      gwei = Math.floor(Math.random() * (MAX_GWEI - MIN_GWEI + 1)) + MIN_GWEI;
+    } while (used.has(gwei) && used.size < (MAX_GWEI - MIN_GWEI + 1));
+    used.add(gwei);
+    return (gwei * 1e9).toString();
+  });
 }
 
 async function main() {
@@ -1786,51 +1927,93 @@ async function main() {
   const srcAddr    = srcArt.networks[Object.keys(srcArt.networks).pop()].address;
   const srcNode    = new srcWeb3.eth.Contract(srcArt.abi, srcAddr);
 
-  const accounts = await srcWeb3.eth.getAccounts();
-  const dstAccs  = await dstWeb3.eth.getAccounts();
-
-  // ⚠️ 不讀 eth_chainId，使用邏輯 ID
+  const accounts  = await srcWeb3.eth.getAccounts();
+  const dstAccs   = await dstWeb3.eth.getAccounts();
+  // 使用邏輯 ID（與 deploy.js 一致），不讀 eth_chainId
   const dstChainId = isAB ? "8546" : "8545";
 
   console.log("==========================================");
   console.log(" AO4C TOD Experiment");
-  console.log(`  Direction : ${DIRECTION}`);
-  console.log(`  Batch size: ${BATCH} tx/round`);
-  console.log(`  Rounds    : ${ROUNDS}`);
-  console.log(`  Amount    : ${AMOUNT} ETH/tx`);
+  console.log(`  Direction  : ${DIRECTION}`);
+  console.log(`  Batch size : ${BATCH} tx/round`);
+  console.log(`  Mode          : ${DURATION_MS ? `TIME ${DURATION_MS/1000}s` : `ROUNDS ${ROUNDS}`}`);
+  console.log(`  Conflict rate : ${(CONFLICT_RATE * 100).toFixed(0)}% (${CONFLICT_RATE === 0 ? "無衝突" : CONFLICT_RATE >= 1 ? "全衝突" : "隨機衝突"})`);
+  console.log(`  Amount        : ${AMOUNT} ETH/tx`);
   console.log("==========================================\n");
 
   const allRoundResults = [];
+  const startTime       = Date.now();
+  let   round           = 0;
+  let   successCount    = 0;
+  let   failCount       = 0;
+  let   totalSent       = 0;
 
-  for (let round = 0; round < ROUNDS; round++) {
-    console.log(`\n[TOD] === Round ${round + 1} / ${ROUNDS} ===`);
+  const shouldContinue = () =>
+    DURATION_MS ? (Date.now() - startTime) < DURATION_MS : round < ROUNDS;
+
+  while (shouldContinue()) {
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(0);
+    const label   = DURATION_MS
+      ? `Round ${round + 1} (${elapsed}s / ${DURATION_MS/1000}s)`
+      : `Round ${round + 1} / ${ROUNDS}`;
+    console.log(`\n[TOD] === ${label} ===`);
+
     const roundResults = await runRound(round, srcNode, srcWeb3, accounts, dstAccs, dstChainId);
     allRoundResults.push(...roundResults);
+    const roundOk   = roundResults.filter(r => r.revealStatus === "ok").length;
+    const roundFail = roundResults.filter(r => r.revealStatus !== "ok").length;
+    successCount += roundOk;
+    failCount    += roundFail;
+    totalSent    += roundResults.length;
     analyzeRound(round + 1, roundResults);
-    if (round < ROUNDS - 1) await sleep(2000);
+    round++;
+
+    if (shouldContinue()) await sleep(2000);
   }
+
+  const totalMs  = Date.now() - startTime;
+  const tps      = (successCount / (totalMs / 1000)).toFixed(3);
 
   console.log("\n[TOD] === Overall Analysis ===");
   analyzeOverall(allRoundResults);
+  console.log(`\nThroughput : ${tps} TPS (${successCount} tx / ${(totalMs/1000).toFixed(1)}s)`);
 
   const gen = new TodReportGenerator();
   await gen.generate(allRoundResults, {
-    batch: BATCH, rounds: ROUNDS, amount: AMOUNT,
+    batch: BATCH, rounds: round, amount: AMOUNT,
     direction: DIRECTION, reportDir: REPORT_DIR,
+    durationMs: totalMs, tps: parseFloat(tps),
+    conflictRate: CONFLICT_RATE,
+    totalSent, successCount, failCount,
   });
 
   process.exit(0);
 }
 
 async function runRound(roundIdx, srcNode, srcWeb3, accounts, dstAccs, dstChainId) {
-  const gasPrices = buildGasPrices(BATCH);
-  const amount    = srcWeb3.utils.toWei(AMOUNT, "ether");
-  const recipient = dstAccs[0];
+  const gasPrices  = buildGasPrices(BATCH);
+  const amount     = srcWeb3.utils.toWei(AMOUNT, "ether");
+  const recipient  = dstAccs[0];
+  const roundStart = Date.now();
 
-  console.log(`[TOD] Preparing ${BATCH} tx with gasPrice: ${gasPrices.map(g => parseInt(g)/1e9 + "Gwei").join(", ")}`);
+  const gasPricesSorted = [...gasPrices].map(g => parseInt(g)/1e9).sort((a,b)=>a-b);
+  console.log(`[TOD] Preparing ${BATCH} tx with random gasPrice range: ${gasPricesSorted[0]}~${gasPricesSorted[gasPricesSorted.length-1]} Gwei`);
 
+  // 依 CONFLICT_RATE 隨機決定每筆是否複用已出現的 sender
+  const usedSenders = [];
   const txMeta = Array.from({ length: BATCH }, (_, i) => {
-    const sender        = accounts[i % accounts.length];
+    let sender;
+    if (usedSenders.length > 0 && Math.random() < CONFLICT_RATE) {
+      // 複用批次內已出現的 sender → 製造 double-spend 衝突
+      sender = usedSenders[Math.floor(Math.random() * usedSenders.length)];
+    } else {
+      // 挑一個批次內尚未出現的 sender
+      const fresh = accounts.filter(a => !usedSenders.includes(a));
+      sender = fresh.length > 0
+        ? fresh[Math.floor(Math.random() * fresh.length)]
+        : accounts[Math.floor(Math.random() * accounts.length)];
+      usedSenders.push(sender);
+    }
     const salt          = srcWeb3.utils.randomHex(32);
     const blindedAmount = srcWeb3.utils.soliditySha3(
       { type: "uint256", value: amount },
@@ -1838,14 +2021,28 @@ async function runRound(roundIdx, srcNode, srcWeb3, accounts, dstAccs, dstChainI
     );
     return { i, sender, salt, blindedAmount, gasPrice: gasPrices[i], amount, recipient };
   });
+  const conflictCount = BATCH - usedSenders.length;
+  console.log(`[TOD] Conflict senders this round: ${conflictCount}/${BATCH} (rate=${(CONFLICT_RATE*100).toFixed(0)}%}`);
 
   console.log(`[TOD] Sending ${BATCH} commitOrder simultaneously...`);
   const commitResults = await Promise.all(txMeta.map(async (meta) => {
     try {
       const tx = await srcNode.methods
         .commitOrder(meta.blindedAmount, meta.recipient, dstChainId)
-        .send({ from: meta.sender, value: meta.amount, gas: 200000, gasPrice: meta.gasPrice });
-      return { ...meta, requestId: tx.events?.OrderCommitted?.returnValues?.requestId, commitTxHash: tx.transactionHash, commitBlock: tx.blockNumber, commitTxIndex: tx.transactionIndex, commitStatus: "ok" };
+        .send({
+          from:     meta.sender,
+          value:    meta.amount,
+          gas:      200000,
+          gasPrice: meta.gasPrice,
+        });
+      return {
+        ...meta,
+        requestId:    tx.events?.OrderCommitted?.returnValues?.requestId,
+        commitTxHash: tx.transactionHash,
+        commitBlock:  Number(tx.blockNumber),
+        commitTxIndex: Number(tx.transactionIndex),
+        commitStatus: "ok",
+      };
     } catch (err) {
       return { ...meta, commitStatus: "failed", error: err.message.slice(0, 100) };
     }
@@ -1859,36 +2056,59 @@ async function runRound(roundIdx, srcNode, srcWeb3, accounts, dstAccs, dstChainI
     try {
       const tx = await srcNode.methods
         .revealOrder(meta.requestId, meta.amount, meta.salt)
-        .send({ from: meta.sender, gas: 200000, gasPrice: meta.gasPrice });
+        .send({
+          from:     meta.sender,
+          gas:      200000,
+          gasPrice: meta.gasPrice,
+        });
+
       const seqNo = tx.events?.OrderRevealed?.returnValues?.seqNo;
-      return { ...meta, seqNo: seqNo ? parseInt(seqNo) : null, revealTxHash: tx.transactionHash, revealBlock: tx.blockNumber, revealTxIndex: tx.transactionIndex, revealStatus: "ok", round: roundIdx + 1 };
+      return {
+        ...meta,
+        seqNo:         seqNo != null ? Number(seqNo) : null,
+        revealTxHash:  tx.transactionHash,
+        revealBlock:   Number(tx.blockNumber),
+        revealTxIndex: Number(tx.transactionIndex),
+        revealStatus:  "ok",
+        round:         roundIdx + 1,
+        timestamp:     roundStart,
+      };
     } catch (err) {
-      return { ...meta, revealStatus: "failed", error: err.message.slice(0, 100), round: roundIdx + 1 };
+      return { ...meta, revealStatus: "failed", error: err.message.slice(0, 100), round: roundIdx + 1, timestamp: roundStart };
     }
   }));
 
   const okReveals = revealResults.filter(r => r.revealStatus === "ok" && r.seqNo !== null);
   console.log(`[TOD] revealOrder done: ${okReveals.length}/${okCommits.length} success`);
+
   return revealResults;
 }
 
 function analyzeRound(roundNum, results) {
   const ok = results.filter(r => r.revealStatus === "ok" && r.seqNo !== null);
   if (ok.length < 2) { console.log("[TOD] Not enough data for analysis"); return; }
+
   console.log(`\n[TOD] Round ${roundNum} Ordering Analysis:`);
   console.log("  gasPrice(Gwei) | txIndex(miner) | seqNo(AO4C) | sender");
   ok.sort((a, b) => a.seqNo - b.seqNo).forEach(r => {
     const gwei = parseInt(r.gasPrice) / 1e9;
     console.log(`  ${String(gwei).padStart(14)} | ${String(r.revealTxIndex).padStart(14)} | ${String(r.seqNo).padStart(11)} | ${r.sender.slice(0,10)}...`);
   });
-  const spearman = spearmanCorrelation(ok.map(r => parseInt(r.gasPrice)), ok.map(r => r.seqNo));
+
+  const spearman = spearmanCorrelation(
+    ok.map(r => parseInt(r.gasPrice)),
+    ok.map(r => r.seqNo)
+  );
   console.log(`\n  Spearman(gasPrice, seqNo) = ${spearman.toFixed(4)}`);
-  console.log(`  → ${Math.abs(spearman) < 0.3 ? "✓ 低相關：TOD 防護有效" : "⚠ 高相關：需進一步分析"}`);
+  console.log(`  → ${Math.abs(spearman) < 0.3 ? "✓ 低相關：AO4C seqNo 與 gasPrice 無關，TOD 防護有效" : "⚠ 高相關：需進一步分析"}`);
 }
 
 function analyzeOverall(results) {
   const ok = results.filter(r => r.revealStatus === "ok" && r.seqNo !== null);
-  const spearman = spearmanCorrelation(ok.map(r => parseInt(r.gasPrice)), ok.map(r => r.seqNo));
+  const spearman = spearmanCorrelation(
+    ok.map(r => parseInt(r.gasPrice)),
+    ok.map(r => r.seqNo)
+  );
   console.log(`Overall Spearman(gasPrice, seqNo) = ${spearman.toFixed(4)}`);
   console.log(`Total analyzed: ${ok.length} transactions across ${new Set(ok.map(r => r.round)).size} rounds`);
   console.log(Math.abs(spearman) < 0.3
@@ -1900,9 +2120,13 @@ function analyzeOverall(results) {
 function spearmanCorrelation(arrX, arrY) {
   const n = arrX.length;
   if (n < 2) return 0;
-  const rankX = getRanks(arrX), rankY = getRanks(arrY);
+  const rankX = getRanks(arrX);
+  const rankY = getRanks(arrY);
   let sumD2 = 0;
-  for (let i = 0; i < n; i++) { const d = rankX[i] - rankY[i]; sumD2 += d * d; }
+  for (let i = 0; i < n; i++) {
+    const d = rankX[i] - rankY[i];
+    sumD2 += d * d;
+  }
   return 1 - (6 * sumD2) / (n * (n * n - 1));
 }
 
@@ -1924,12 +2148,6 @@ function parseArgs(argv) {
 main().catch(err => { console.error("[TOD] Fatal:", err.message); process.exit(1); });
 ```
 
-### stress-test/tod-report-generator.js
-
-（內容與原版相同，無需修改 — 不含任何 chainId 讀取邏輯）
-
-請直接使用本文件 Step 8b 結尾以前所建置的版本，或從上一次建置的檔案複製。
-
 ### scripts/run-tod-test.sh
 
 ```bash
@@ -1938,25 +2156,41 @@ set -e
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_ROOT"
 
-BATCH=${1:-10}
-ROUNDS=${2:-5}
-AMOUNT=${3:-"0.001"}
-DIRECTION=${4:-"AB"}
+# ── 參數 ────────────────────────────────────────────────────────
+BATCH=${1:-10}               # 每輪同時送出的交易數
+DURATION_MIN=${2:-10}       # 實驗持續分鐘數（預設 10 分鐘）
+AMOUNT=${3:-"0.001"}        # 每筆金額 ETH
+DIRECTION=${4:-"AB"}        # AB 或 BA
+CONFLICT_RATE=${5:-"0.3"}   # 衝突率 0.0~1.0（預設 0.3，約 30% 交易觸發衝突）
 REPORT_DIR="$PROJECT_ROOT/reports"
+DURATION_SEC=$((DURATION_MIN * 60))
 mkdir -p "$REPORT_DIR"
 
 echo "============================================"
 echo " AO4C TOD Protection Experiment"
-echo " Batch size : $BATCH tx (sent simultaneously)"
-echo " Rounds     : $ROUNDS"
-echo " Amount/tx  : $AMOUNT ETH"
-echo " Direction  : $DIRECTION"
+echo " Batch size    : $BATCH tx (sent simultaneously)"
+echo " Duration      : ${DURATION_MIN} min (${DURATION_SEC}s)"
+echo " Conflict rate : $CONFLICT_RATE (0=無衝突, 0.3=30%隨機衝突, 1=全衝突)"
+echo " Amount/tx     : $AMOUNT ETH"
+echo " Direction     : $DIRECTION"
+echo " Report dir    : $REPORT_DIR"
 echo "============================================"
+echo ""
+echo "實驗說明："
+echo "  每輪同時送出 $BATCH 筆交易，每筆 gasPrice 隨機（5~200 Gwei）"
+echo "  衝突率 $CONFLICT_RATE → 每批約 $(echo "$BATCH $CONFLICT_RATE" | awk '{printf "%d", $1*$2}') 筆複用已出現 sender → AI 偵測 double-spend"
+echo "  模擬攻擊者試圖透過 gasPrice 操控礦工排序（TOD 攻擊場景）"
+echo "  記錄 gasPrice排名 / txIndex排名（礦工） / seqNo排名（AO4C）三欄"
+echo "  若 Spearman(gasPrice, seqNo) 接近 0 → TOD 防護有效"
+echo ""
 
+# ── 確認鏈是否在線 ──────────────────────────────────────────────
 CHAIN_DOWN=false
 for PORT in 8545 8546; do
-  curl -sf -X POST "http://127.0.0.1:$PORT" -H "Content-Type: application/json" \
-    -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' > /dev/null 2>&1 || CHAIN_DOWN=true
+  curl -sf -X POST "http://127.0.0.1:$PORT" \
+    -H "Content-Type: application/json" \
+    -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
+    > /dev/null 2>&1 || CHAIN_DOWN=true
 done
 
 if [ "$CHAIN_DOWN" = true ]; then
@@ -1967,9 +2201,11 @@ else
   echo "[OK] Both chains are running."
 fi
 
+# ── 確認 Oracle 在線 ─────────────────────────────────────────────
 if [ -f "$PROJECT_ROOT/logs/oracle.pid" ]; then
   PID=$(cat "$PROJECT_ROOT/logs/oracle.pid")
   if ! kill -0 "$PID" 2>/dev/null; then
+    echo "[Setup] Oracle not running, restarting..."
     node "$PROJECT_ROOT/oracle/oracle.js" > "$PROJECT_ROOT/logs/oracle.log" 2>&1 &
     echo $! > "$PROJECT_ROOT/logs/oracle.pid"
     sleep 2
@@ -1977,19 +2213,27 @@ if [ -f "$PROJECT_ROOT/logs/oracle.pid" ]; then
     echo "[OK] Oracle is running (PID $PID)."
   fi
 else
+  echo "[Setup] Starting Oracle..."
   node "$PROJECT_ROOT/oracle/oracle.js" > "$PROJECT_ROOT/logs/oracle.log" 2>&1 &
   echo $! > "$PROJECT_ROOT/logs/oracle.pid"
   sleep 2
 fi
 
-node stress-test/tod-test.js \
-  --batch     "$BATCH"     \
-  --rounds    "$ROUNDS"    \
-  --amount    "$AMOUNT"    \
-  --direction "$DIRECTION" \
-  --report-dir "$REPORT_DIR"
+echo ""
+echo "[TOD] Starting experiment..."
+echo ""
 
-echo "[TOD] Experiment complete. Reports: $REPORT_DIR/"
+node stress-test/tod-test.js \
+  --batch          "$BATCH"          \
+  --duration       "$DURATION_SEC"   \
+  --conflict-rate  "$CONFLICT_RATE"  \
+  --amount         "$AMOUNT"         \
+  --direction      "$DIRECTION"      \
+  --report-dir     "$REPORT_DIR"
+
+echo ""
+echo "[TOD] Experiment complete."
+echo "[TOD] Reports saved to: $REPORT_DIR/"
 ls -lh "$REPORT_DIR"/ao4c-tod-*.xlsx 2>/dev/null || echo "(No TOD report found)"
 ```
 
@@ -1998,24 +2242,30 @@ ls -lh "$REPORT_DIR"/ao4c-tod-*.xlsx 2>/dev/null || echo "(No TOD report found)"
 ## scripts/monitor.js
 
 ```javascript
+/**
+ * monitor.js — AO4C 即時監控（雙向，三階段事件 + AI Agent 衝突判定）
+ */
 const { Web3 } = require("web3");
 const fs   = require("fs");
 const path = require("path");
 
-const WS_A = "ws://127.0.0.1:8545";
-const WS_B = "ws://127.0.0.1:8546";
+const WS_A   = "ws://127.0.0.1:8545";
+const WS_B   = "ws://127.0.0.1:8546";
+const AI_LOG = path.join(__dirname, "../logs/ai-decisions.jsonl");
 
 const C = {
   reset: "\x1b[0m", bold: "\x1b[1m", dim: "\x1b[2m",
   green: "\x1b[32m", cyan: "\x1b[36m", yellow: "\x1b[33m",
-  red: "\x1b[31m", purple: "\x1b[35m", blue: "\x1b[34m",
+  red: "\x1b[31m", purple: "\x1b[35m", blue: "\x1b[34m", orange: "\x1b[33m",
 };
 
 const stats = { committed: 0, aborted: 0, pending: 0, revealed: 0, startTime: Date.now() };
+const aiStats = { batches: 0, singleSkip: 0, aiCommits: 0, aiAborts: 0, errors: 0, lastBatchTime: null, lastElapsedMs: null };
+let aiLogLinesRead = 0;
 
-function ts()            { return new Date().toLocaleTimeString("zh-TW", { hour12: false }); }
-function shortAddr(addr) { return addr ? `${addr.slice(0,6)}...${addr.slice(-4)}` : "—"; }
-function formatEth(wei)  { return (Number(wei) / 1e18).toFixed(4) + " ETH"; }
+function ts()             { return new Date().toLocaleTimeString("zh-TW", { hour12: false }); }
+function shortAddr(addr)  { return addr ? `${addr.slice(0,6)}...${addr.slice(-4)}` : "—"; }
+function formatEth(wei)   { return (Number(wei) / 1e18).toFixed(4) + " ETH"; }
 
 function printStats() {
   const elapsed = ((Date.now() - stats.startTime) / 1000).toFixed(0);
@@ -2031,11 +2281,65 @@ function printStats() {
   );
 }
 
+// 讀取 AI Agent log 檔，顯示新增的判定事件
+function pollAiLog() {
+  try {
+    if (!fs.existsSync(AI_LOG)) return;
+    const content = fs.readFileSync(AI_LOG, "utf8");
+    const lines   = content.split("\n").filter(l => l.trim());
+    if (lines.length <= aiLogLinesRead) return;
+
+    const newLines = lines.slice(aiLogLinesRead);
+    aiLogLinesRead = lines.length;
+
+    for (const line of newLines) {
+      let entry;
+      try { entry = JSON.parse(line); } catch { continue; }
+
+      if (entry.type === "batch_start") {
+        const seqList = entry.seqNos.join(", ");
+        console.log(`\n${C.yellow}[AI▶ START ]${C.reset} ${ts()} 批次大小=${C.bold}${entry.size}${C.reset} seqNos=[${seqList}]`);
+
+      } else if (entry.type === "ai_result") {
+        aiStats.batches++;
+        aiStats.aiCommits += entry.commits;
+        aiStats.aiAborts  += entry.aborts;
+        aiStats.lastBatchTime   = new Date(entry.time).toLocaleTimeString("zh-TW", { hour12: false });
+        aiStats.lastElapsedMs   = entry.elapsed_ms;
+
+        let abortStr = "";
+        if (entry.aborts > 0 && entry.abort_details?.length) {
+          abortStr = " " + entry.abort_details.map(a => `seqNo=${a.seqNo}:${a.note}`).join("; ");
+        }
+        console.log(
+          `\n${C.green}[AI✔ DONE  ]${C.reset} ${ts()} ` +
+          `耗時=${C.cyan}${entry.elapsed_ms}ms${C.reset} ` +
+          `commit=${C.green}${entry.commits}${C.reset} ` +
+          `abort=${entry.aborts > 0 ? C.red : C.dim}${entry.aborts}${C.reset}` +
+          (abortStr ? `${C.red}${abortStr}${C.reset}` : "")
+        );
+
+      } else if (entry.type === "ai_error") {
+        aiStats.errors++;
+        console.log(`\n${C.red}[AI✘ ERROR ]${C.reset} ${ts()} 耗時=${entry.elapsed_ms}ms err=${C.red}${entry.error?.slice(0,120)}${C.reset} → fallback全部commit`);
+
+      } else if (entry.type === "single_tx_skip") {
+        aiStats.singleSkip++;
+        console.log(`\n${C.dim}[AI- SKIP  ]${C.reset} ${ts()} 單筆交易(seqNo=${entry.seqNo}) 不需 AI 判斷，直接 commit`);
+      }
+
+      printStats();
+    }
+  } catch (_) {}
+}
+
 async function main() {
   console.clear();
-  console.log(`${C.bold}${C.cyan}╔══════════════════════════════════════════════╗${C.reset}`);
-  console.log(`${C.bold}${C.cyan}║  AO4C Cross-Chain Lab — 即時監控            ║${C.reset}`);
-  console.log(`${C.bold}${C.cyan}╚══════════════════════════════════════════════╝${C.reset}\n`);
+  console.log(`${C.bold}${C.cyan}╔══════════════════════════════════════════════════╗${C.reset}`);
+  console.log(`${C.bold}${C.cyan}║  AO4C Cross-Chain Lab — 即時監控（含 AI Agent）  ║${C.reset}`);
+  console.log(`${C.bold}${C.cyan}╚══════════════════════════════════════════════════╝${C.reset}\n`);
+  console.log(`${C.dim}事件圖示：[A/B REVEAL] Phase2 ｜ [A/B COMMIT] Phase3a ｜ [A/B ABORT] Phase3b${C.reset}`);
+  console.log(`${C.dim}AI  圖示：[AI▶ START] 批次送判 ｜ [AI✔ DONE] 判定完成 ｜ [AI✘ ERROR] 呼叫失敗 ｜ [AI- SKIP] 單筆跳過${C.reset}\n`);
 
   const artA = JSON.parse(fs.readFileSync(path.join(__dirname, "../build/chainA/BridgeNode.json")));
   const artB = JSON.parse(fs.readFileSync(path.join(__dirname, "../build/chainB/BridgeNode.json")));
@@ -2045,12 +2349,16 @@ async function main() {
   console.log(`${C.blue}[A]${C.reset} BridgeNode: ${C.cyan}${addrA}${C.reset}`);
   console.log(`${C.purple}[B]${C.reset} BridgeNode: ${C.cyan}${addrB}${C.reset}\n`);
 
-  const webA  = new Web3(new Web3.providers.WebsocketProvider(WS_A));
-  const webB  = new Web3(new Web3.providers.WebsocketProvider(WS_B));
+  const webA = new Web3(new Web3.providers.WebsocketProvider(WS_A));
+  const webB = new Web3(new Web3.providers.WebsocketProvider(WS_B));
   const nodeA = new webA.eth.Contract(artA.abi, addrA);
   const nodeB = new webB.eth.Contract(artB.abi, addrB);
 
-  for (const [node, label, color] of [[nodeA, "A", C.blue], [nodeB, "B", C.purple]]) {
+  for (const [node, web, label, color] of [
+    [nodeA, webA, "A", C.blue],
+    [nodeB, webB, "B", C.purple],
+  ]) {
+    // Phase 2: OrderRevealed
     const subRev = await node.events.OrderRevealed({ fromBlock: "latest" });
     subRev.on("data", e => {
       const { seqNo, sender, amount, targetChainId } = e.returnValues;
@@ -2059,6 +2367,7 @@ async function main() {
       printStats();
     });
 
+    // Phase 3a: OrderExecuted
     const subExec = await node.events.OrderExecuted({ fromBlock: "latest" });
     subExec.on("data", e => {
       const { seqNo, recipient, amount, newGlobalVersion } = e.returnValues;
@@ -2067,6 +2376,7 @@ async function main() {
       printStats();
     });
 
+    // Phase 3b: OrderAborted
     const subAbort = await node.events.OrderAborted({ fromBlock: "latest" });
     subAbort.on("data", e => {
       const { seqNo, sender, amount, reason } = e.returnValues;
@@ -2076,8 +2386,12 @@ async function main() {
     });
   }
 
-  console.log(`${C.green}[監控中]${C.reset} 等待交易...\n`);
+  const aiLogStatus = fs.existsSync(AI_LOG) ? `${C.green}找到${C.reset}` : `${C.yellow}等待 Oracle 啟動...${C.reset}`;
+  console.log(`${C.green}[監控中]${C.reset} 等待交易... AI決策日誌: ${aiLogStatus}\n`);
   printStats();
+
+  // 每秒輪詢 AI Agent log
+  setInterval(pollAiLog, 1000);
 
   setInterval(async () => {
     try {
@@ -2085,7 +2399,7 @@ async function main() {
         webA.eth.getBalance(addrA), webB.eth.getBalance(addrB),
         nodeA.methods.globalVersion().call(), nodeB.methods.globalVersion().call(),
       ]);
-      console.log(`\n${C.dim}[快照]${C.reset} ${ts()} A=${C.yellow}${formatEth(bA)}${C.reset} verA=${vA} | B=${C.green}${formatEth(bB)}${C.reset} verB=${vB}`);
+      console.log(`\n${C.dim}[快照]${C.reset} ${ts()} A=${C.yellow}${formatEth(bA)}${C.reset} verA=${vA} | B=${C.green}${formatEth(bB)}${C.reset} verB=${vB} | AI批次=${C.yellow}${aiStats.batches}${C.reset} AI衝突=${C.red}${aiStats.aiAborts}${C.reset} 錯誤=${aiStats.errors}`);
       printStats();
     } catch (_) {}
   }, 10000);
@@ -2093,7 +2407,10 @@ async function main() {
   process.on("SIGINT", () => {
     const elapsed = ((Date.now() - stats.startTime) / 1000).toFixed(1);
     console.log(`\n\n${C.bold}=== 監控結束 ===${C.reset}`);
-    console.log(`執行時間:${elapsed}s | Revealed:${stats.revealed} | Committed:${stats.committed} | Aborted:${stats.aborted}`);
+    console.log(`執行時間: ${elapsed}s`);
+    console.log(`鏈上事件  → Revealed:${stats.revealed} | Committed:${stats.committed} | Aborted:${stats.aborted} | Pending:${stats.pending}`);
+    console.log(`AI Agent  → 觸發批次:${aiStats.batches} | AI判定commit:${aiStats.aiCommits} | AI判定abort:${aiStats.aiAborts} | 單筆跳過:${aiStats.singleSkip} | 呼叫失敗:${aiStats.errors}`);
+    if (aiStats.lastBatchTime) console.log(`最後AI判定: ${aiStats.lastBatchTime} (耗時 ${aiStats.lastElapsedMs}ms)`);
     process.exit(0);
   });
 }
@@ -2138,8 +2455,8 @@ bash scripts/start-ui.sh
 # 7. 壓力測試
 bash scripts/auto-stress-test.sh 60 10 0.001
 
-# 8. TOD 防護實驗
-bash scripts/run-tod-test.sh 10 5 0.001 AB
+# 8. TOD 防護實驗（batch=10, duration=10min, amount=0.001, direction=AB, conflict-rate=0.3）
+bash scripts/run-tod-test.sh 10 10 0.001 AB 0.3
 
 # 9. 停止
 kill $(cat logs/chainA.pid) $(cat logs/chainB.pid) $(cat logs/oracle.pid) 2>/dev/null || true
