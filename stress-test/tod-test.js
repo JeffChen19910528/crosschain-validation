@@ -30,11 +30,13 @@
 require("dotenv").config({ path: __dirname + "/../oracle/.env" });
 const { Web3 }        = require("web3");
 const TodReportGenerator = require("./tod-report-generator");
-const fs              = require("fs");
-const path            = require("path");
+const { CHAINS }          = require("../lib/chains");
+const { loadContract }    = require("../lib/contractArtifact");
+const { parseArgs }       = require("../lib/cliArgs");
+const { spearman } = require("../lib/statsUtils");
 
-const CHAIN_A_URL = process.env.CHAIN_A_URL || "http://127.0.0.1:8545";
-const CHAIN_B_URL = process.env.CHAIN_B_URL || "http://127.0.0.1:8546";
+const CHAIN_A_URL = CHAINS.A.rpcUrl;
+const CHAIN_B_URL = CHAINS.B.rpcUrl;
 
 const args          = parseArgs(process.argv.slice(2));
 const BATCH         = parseInt(args.batch     || "10");
@@ -69,15 +71,14 @@ async function main() {
   const srcWeb3 = new Web3(srcUrl);
   const dstWeb3 = new Web3(dstUrl);
 
-  const srcArtPath = path.join(__dirname, `../build/chain${isAB ? "A" : "B"}/BridgeNode.json`);
-  const srcArt     = JSON.parse(fs.readFileSync(srcArtPath));
-  const srcAddr    = srcArt.networks[Object.keys(srcArt.networks).pop()].address;
-  const srcNode    = new srcWeb3.eth.Contract(srcArt.abi, srcAddr);
+  const srcChainCfg = isAB ? CHAINS.A : CHAINS.B;
+  const dstChainCfg = isAB ? CHAINS.B : CHAINS.A;
+  const { contract: srcNode } = loadContract(srcWeb3, srcChainCfg.buildPath);
 
   const accounts  = await srcWeb3.eth.getAccounts();
   const dstAccs   = await dstWeb3.eth.getAccounts();
-  // 使用邏輯 ID（與 deploy.js 一致），不讀 eth_chainId
-  const dstChainId = isAB ? "8546" : "8545";
+  // 使用邏輯 ID（與 lib/chains.js 一致），不讀 eth_chainId
+  const dstChainId = dstChainCfg.chainId;
 
   console.log("==========================================");
   console.log(" AO4C TOD Experiment");
@@ -242,54 +243,28 @@ function analyzeRound(roundNum, results) {
     console.log(`  ${String(gwei).padStart(14)} | ${String(r.revealTxIndex).padStart(14)} | ${String(r.seqNo).padStart(11)} | ${r.sender.slice(0,10)}...`);
   });
 
-  const spearman = spearmanCorrelation(
+  const rho = spearman(
     ok.map(r => parseInt(r.gasPrice)),
     ok.map(r => r.seqNo)
   );
-  console.log(`\n  Spearman(gasPrice, seqNo) = ${spearman.toFixed(4)}`);
-  console.log(`  → ${Math.abs(spearman) < 0.3 ? "✓ 低相關：AO4C seqNo 與 gasPrice 無關，TOD 防護有效" : "⚠ 高相關：需進一步分析"}`);
+  console.log(`\n  Spearman(gasPrice, seqNo) = ${rho.toFixed(4)}`);
+  console.log(`  → ${Math.abs(rho) < 0.3 ? "✓ 低相關：AO4C seqNo 與 gasPrice 無關，TOD 防護有效" : "⚠ 高相關：需進一步分析"}`);
 }
 
 function analyzeOverall(results) {
   const ok = results.filter(r => r.revealStatus === "ok" && r.seqNo !== null);
-  const spearman = spearmanCorrelation(
+  const rho = spearman(
     ok.map(r => parseInt(r.gasPrice)),
     ok.map(r => r.seqNo)
   );
-  console.log(`Overall Spearman(gasPrice, seqNo) = ${spearman.toFixed(4)}`);
+  console.log(`Overall Spearman(gasPrice, seqNo) = ${rho.toFixed(4)}`);
   console.log(`Total analyzed: ${ok.length} transactions across ${new Set(ok.map(r => r.round)).size} rounds`);
-  console.log(Math.abs(spearman) < 0.3
+  console.log(Math.abs(rho) < 0.3
     ? "✓ CONCLUSION: AO4C seqNo is independent of gasPrice → TOD protection validated"
     : "⚠ CONCLUSION: Correlation detected, review ordering mechanism"
   );
 }
 
-function spearmanCorrelation(arrX, arrY) {
-  const n = arrX.length;
-  if (n < 2) return 0;
-  const rankX = getRanks(arrX);
-  const rankY = getRanks(arrY);
-  let sumD2 = 0;
-  for (let i = 0; i < n; i++) {
-    const d = rankX[i] - rankY[i];
-    sumD2 += d * d;
-  }
-  return 1 - (6 * sumD2) / (n * (n * n - 1));
-}
-
-function getRanks(arr) {
-  const sorted = [...arr].sort((a, b) => a - b);
-  return arr.map(v => sorted.indexOf(v) + 1);
-}
-
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-function parseArgs(argv) {
-  const args = {};
-  for (let i = 0; i < argv.length; i++) {
-    if (argv[i].startsWith("--")) { args[argv[i].slice(2)] = argv[i + 1]; i++; }
-  }
-  return args;
-}
 
 main().catch(err => { console.error("[TOD] Fatal:", err.message); process.exit(1); });

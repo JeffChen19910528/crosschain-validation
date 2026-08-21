@@ -59,8 +59,26 @@ Phase 3 — AI Validation & Execution
 │  · Claude Code CLI（月訂閱）                         │
 │  · 接收有序序列，判斷語意層衝突                      │
 │  · 回傳 { commits: [...], aborts: [{id, note}] }     │
+├─────────────────────────────────────────────────────┤
+│  共用模組層（lib/）                                  │
+│  · 雙鏈設定、artifact 讀取、統計工具、CLI 參數解析   │
+│  · 供 oracle / scripts / stress-test / ui 共用       │
+│  · 避免 chainId、RPC URL、Spearman 等邏輯多處重複    │
 └─────────────────────────────────────────────────────┘
 ```
+
+### 共用模組（`lib/`）
+
+為降低各層之間的耦合，原本分散在 `oracle.js`、`deploy.js`、`sender.js`、`tod-test.js`、`monitor.js`、`ui/app.js` 六個檔案中重複的邏輯（雙鏈設定、artifact 讀取、Spearman 統計、CLI 參數解析）已抽成單一事實來源：
+
+| 模組 | 職責 | 取代的重複邏輯 |
+|------|------|----------------|
+| `lib/chains.js` | 雙鏈 RPC URL、邏輯 chainId、build artifact 路徑 | 5 處硬編碼的 `"8545"` / `"8546"` |
+| `lib/contractArtifact.js` | 讀取 `build/chain*/BridgeNode.json` 並建立 web3 Contract | 4 處幾乎相同的讀檔+取地址邏輯 |
+| `lib/statsUtils.js` | Spearman 相關係數、排名、Excel 表頭樣式 | report-generator / tod-report-generator / tod-test 三份重複實作 |
+| `lib/cliArgs.js` | `--key value` 參數解析 | sender.js / tod-test.js 各自的 `parseArgs` |
+
+`ui/server.js` 新增 `GET /api/chains`，讓瀏覽器端的 `ui/app.js` 改為向伺服器取得邏輯 chainId，不再把 `"8545"` / `"8546"` 寫死在前端程式碼中。
 
 ---
 
@@ -137,6 +155,39 @@ BridgeNode Contracts
 AI Agent (Claude Code CLI)
   [UP]   claude CLI: X.X.X
 ```
+
+---
+
+## 測試
+
+合約層（BridgeNode.sol）有 Hardhat 單元測試，覆蓋 TOD 排序、front-running 防護、OCC version 衝突、雙向轉帳：
+
+```bash
+npm test
+# 或
+npx hardhat test
+```
+
+```
+BridgeNode (AO4C)
+  Phase 1+2: commit → reveal
+    ✔ assigns strictly increasing seqNo in call order (TOD protection)
+    ✔ rejects reveal with wrong amount/salt (front-running protection)
+    ✔ rejects reveal from a different sender than the committer
+    ✔ rejects double reveal
+  Phase 3: validateAndExecute (oracle-driven)
+    ✔ commits and increments globalVersion when the oracle reports no conflict
+    ✔ aborts and refunds the sender when the oracle reports a conflict
+    ✔ aborts on stale expectedVersion even when the oracle reports no conflict (OCC last line of defense)
+    ✔ rejects validateAndExecute from a non-oracle caller
+  Cross-chain transfer
+    ✔ transfers ETH to the recipient on the destination chain
+    ✔ rejects executeTransfer for an unknown source chain
+
+  10 passing
+```
+
+Oracle / 壓測 / UI 屬於需要實際雙鏈環境的整合層，沒有獨立單元測試，改用 `bash scripts/status.sh` 與小規模 `bash scripts/auto-stress-test.sh 10 2 0.001` 做端到端驗證。
 
 ---
 
@@ -332,6 +383,13 @@ fuser -k 3000/tcp 2>/dev/null || true
 crosschain/
 ├── contracts/
 │   └── BridgeNode.sol          # AO4C 核心合約（雙向對稱）
+├── test/
+│   └── BridgeNode.test.js      # Hardhat 單元測試（TOD/衝突/雙花/雙向轉帳）
+├── lib/
+│   ├── chains.js                # 雙鏈設定單一事實來源（RPC URL、邏輯 chainId、build 路徑）
+│   ├── contractArtifact.js      # 讀取 build artifact + 建立 web3 Contract
+│   ├── statsUtils.js            # Spearman 相關係數 / 排名 / Excel 表頭樣式
+│   └── cliArgs.js               # `--key value` 參數解析
 ├── oracle/
 │   ├── oracle.js               # 雙向 Oracle 中繼
 │   ├── occExecutor.js          # OCC 批次執行器（寫入 AI 判定日誌）

@@ -1,6 +1,7 @@
 const express = require("express");
 const path    = require("path");
 const http    = require("http");
+const { CHAINS } = require("../lib/chains");
 
 const app = express();
 app.use(express.json());
@@ -28,8 +29,13 @@ function rpcProxy(targetPort) {
   };
 }
 
-app.post("/rpc/chainA", rpcProxy(8545));
-app.post("/rpc/chainB", rpcProxy(8546));
+app.post("/rpc/chainA", rpcProxy(new URL(CHAINS.A.rpcUrl).port));
+app.post("/rpc/chainB", rpcProxy(new URL(CHAINS.B.rpcUrl).port));
+
+// 提供邏輯 chainId 給前端，避免 A/B 的 chainId 在 app.js 中重複寫死
+app.get("/api/chains", (req, res) => {
+  res.json({ A: { chainId: CHAINS.A.chainId }, B: { chainId: CHAINS.B.chainId } });
+});
 
 app.listen(3000, () => {
   console.log("[UI] Server running at http://localhost:3000");

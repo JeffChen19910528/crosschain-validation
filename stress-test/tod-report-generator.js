@@ -11,6 +11,7 @@ const ExcelJS = require("exceljs");
 const dayjs   = require("dayjs");
 const path    = require("path");
 const fs      = require("fs");
+const { spearman, getRanks, styleHeader } = require("../lib/statsUtils");
 
 class TodReportGenerator {
   async generate(results, summary) {
@@ -20,9 +21,9 @@ class TodReportGenerator {
 
     const ok = results.filter(r => r.revealStatus === "ok" && r.seqNo !== null);
 
-    const spearmanGasSeq  = this._spearman(ok.map(r => parseInt(r.gasPrice)), ok.map(r => r.seqNo));
-    const spearmanGasTx   = this._spearman(ok.map(r => parseInt(r.gasPrice)), ok.map(r => r.revealTxIndex));
-    const spearmanTxSeq   = this._spearman(ok.map(r => r.revealTxIndex),      ok.map(r => r.seqNo));
+    const spearmanGasSeq  = spearman(ok.map(r => parseInt(r.gasPrice)), ok.map(r => r.seqNo));
+    const spearmanGasTx   = spearman(ok.map(r => parseInt(r.gasPrice)), ok.map(r => r.revealTxIndex));
+    const spearmanTxSeq   = spearman(ok.map(r => r.revealTxIndex),      ok.map(r => r.seqNo));
     const todProtected     = Math.abs(spearmanGasSeq) < 0.3;
 
     // ── Sheet 1：摘要 ──────────────────────────────────────────────
@@ -58,7 +59,7 @@ class TodReportGenerator {
       { key: "TOD 防護結論",                     value: todProtected ? "✓ PROTECTED（|ρ| < 0.3）" : "⚠ REVIEW NEEDED（|ρ| >= 0.3）" },
       { key: "說明",                              value: "seqNo 由 EVM 執行序決定，與 gasPrice 無統計相關性，證明 TOD 防護有效" },
     ]);
-    this._styleHeader(s1);
+    styleHeader(s1, "FF1a3a5c");
 
     const conclusionRow = s1.getRow(23);
     conclusionRow.getCell("value").font = { bold: true };
@@ -84,9 +85,9 @@ class TodReportGenerator {
       { header: "requestId",      key: "requestId",      width: 68 },
     ];
 
-    const gasPriceRanks  = this._getRanks(ok.map(r => parseInt(r.gasPrice)), true);
-    const txIndexRanks   = this._getRanks(ok.map(r => r.revealTxIndex), false);
-    const seqNoRanks     = this._getRanks(ok.map(r => r.seqNo), false);
+    const gasPriceRanks  = getRanks(ok.map(r => parseInt(r.gasPrice)), true);
+    const txIndexRanks   = getRanks(ok.map(r => r.revealTxIndex), false);
+    const seqNoRanks     = getRanks(ok.map(r => r.seqNo), false);
 
     ok.forEach((r, idx) => {
       s2.addRow({
@@ -104,7 +105,7 @@ class TodReportGenerator {
         requestId:     r.requestId || "—",
       });
     });
-    this._styleHeader(s2);
+    styleHeader(s2, "FF1a3a5c");
 
     s2.eachRow((row, rowNum) => {
       if (rowNum === 1) return;
@@ -129,7 +130,7 @@ class TodReportGenerator {
       const mismatch = gasPriceRanks[idx] !== seqNoRanks[idx] ? "Y（AO4C 修正）" : "N";
       s3.addRow({ idx: idx + 1, gasPriceRank: gasPriceRanks[idx], txIndexRank: txIndexRanks[idx], seqNoRank: seqNoRanks[idx], mismatch });
     });
-    this._styleHeader(s3);
+    styleHeader(s3, "FF1a3a5c");
 
     // ── Sheet 4：每輪 Spearman ─────────────────────────────────────
     const s4 = workbook.addWorksheet("Spearman by Round");
@@ -144,13 +145,13 @@ class TodReportGenerator {
     const rounds = [...new Set(ok.map(r => r.round))].sort((a, b) => a - b);
     rounds.forEach(rn => {
       const rData = ok.filter(r => r.round === rn);
-      const rhoGS = this._spearman(rData.map(r => parseInt(r.gasPrice)), rData.map(r => r.seqNo));
-      const rhoGT = this._spearman(rData.map(r => parseInt(r.gasPrice)), rData.map(r => r.revealTxIndex));
-      const rhoTS = this._spearman(rData.map(r => r.revealTxIndex),      rData.map(r => r.seqNo));
+      const rhoGS = spearman(rData.map(r => parseInt(r.gasPrice)), rData.map(r => r.seqNo));
+      const rhoGT = spearman(rData.map(r => parseInt(r.gasPrice)), rData.map(r => r.revealTxIndex));
+      const rhoTS = spearman(rData.map(r => r.revealTxIndex),      rData.map(r => r.seqNo));
       const prot  = Math.abs(rhoGS) < 0.3 ? "✓" : "⚠";
       s4.addRow({ round: rn, count: rData.length, rhoGS: rhoGS.toFixed(4), rhoGT: rhoGT.toFixed(4), rhoTS: rhoTS.toFixed(4), protected: prot });
     });
-    this._styleHeader(s4);
+    styleHeader(s4, "FF1a3a5c");
     s4.eachRow((row, rowNum) => {
       if (rowNum === 1) return;
       const prot = row.getCell("protected").value;
@@ -176,10 +177,10 @@ class TodReportGenerator {
     rounds.forEach(rn => {
       const rData    = ok.filter(r => r.round === rn);
       const failed   = results.filter(r => r.round === rn && r.revealStatus !== "ok").length;
-      const rhoGS    = this._spearman(rData.map(r => parseInt(r.gasPrice)), rData.map(r => r.seqNo));
+      const rhoGS    = spearman(rData.map(r => parseInt(r.gasPrice)), rData.map(r => r.seqNo));
       const prot     = Math.abs(rhoGS) < 0.3 ? "✓" : "⚠";
-      const rGas  = this._getRanks(rData.map(r => parseInt(r.gasPrice)), true);
-      const rSeq  = this._getRanks(rData.map(r => r.seqNo), false);
+      const rGas  = getRanks(rData.map(r => parseInt(r.gasPrice)), true);
+      const rSeq  = getRanks(rData.map(r => r.seqNo), false);
       const corrected = rData.filter((_, i) => rGas[i] !== rSeq[i]).length;
       s5.addRow({
         round:         rn,
@@ -193,7 +194,7 @@ class TodReportGenerator {
         correctedRate: rData.length > 0 ? ((corrected / rData.length) * 100).toFixed(1) : "0",
       });
     });
-    this._styleHeader(s5);
+    styleHeader(s5, "FF1a3a5c");
     s5.eachRow((row, rowNum) => {
       if (rowNum === 1) return;
       const prot = row.getCell("protected").value;
@@ -247,7 +248,7 @@ class TodReportGenerator {
     } else {
       s6.addRow({ minute: "※", sent: "無 timestamp 資料（舊版結果）" });
     }
-    this._styleHeader(s6);
+    styleHeader(s6, "FF1a3a5c");
 
     fs.mkdirSync(summary.reportDir, { recursive: true });
     const filename = `ao4c-tod-experiment-${dayjs().format("YYYYMMDD-HHmmss")}.xlsx`;
@@ -257,30 +258,6 @@ class TodReportGenerator {
     return filepath;
   }
 
-  _spearman(arrX, arrY) {
-    const n = arrX.length;
-    if (n < 2) return 0;
-    const rX = this._getRanks(arrX, false);
-    const rY = this._getRanks(arrY, false);
-    let sumD2 = 0;
-    for (let i = 0; i < n; i++) { const d = rX[i] - rY[i]; sumD2 += d * d; }
-    return 1 - (6 * sumD2) / (n * (n * n - 1));
-  }
-
-  _getRanks(arr, descending = false) {
-    const nums = arr.map(v => Number(v));
-    const sorted = [...nums].sort((a, b) => descending ? b - a : a - b);
-    return nums.map(v => sorted.indexOf(v) + 1);
-  }
-
-  _styleHeader(sheet) {
-    sheet.getRow(1).eachCell(cell => {
-      cell.font      = { bold: true, color: { argb: "FFFFFFFF" } };
-      cell.fill      = { type: "pattern", pattern: "solid", fgColor: { argb: "FF1a3a5c" } };
-      cell.alignment = { horizontal: "center" };
-    });
-    sheet.getRow(1).height = 20;
-  }
 }
 
 module.exports = TodReportGenerator;

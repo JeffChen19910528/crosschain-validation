@@ -5,6 +5,7 @@
 const { ethers } = require("hardhat");
 const fs   = require("fs");
 const path = require("path");
+const { CHAINS } = require("../lib/chains");
 
 async function deployBridgeNode(rpcUrl, chainId, oracleAddress) {
   console.log(`\n[Deploy] BridgeNode → ${rpcUrl} (chainId=${chainId})`);
@@ -29,10 +30,10 @@ async function deployBridgeNode(rpcUrl, chainId, oracleAddress) {
 }
 
 async function main() {
-  const CHAIN_A_URL = "http://127.0.0.1:8545";
-  const CHAIN_B_URL = "http://127.0.0.1:8546";
-  const BUILD_A     = path.join(__dirname, "../build/chainA");
-  const BUILD_B     = path.join(__dirname, "../build/chainB");
+  const CHAIN_A_URL = CHAINS.A.rpcUrl;
+  const CHAIN_B_URL = CHAINS.B.rpcUrl;
+  const BUILD_A     = path.dirname(CHAINS.A.buildPath);
+  const BUILD_B     = path.dirname(CHAINS.B.buildPath);
 
   fs.mkdirSync(BUILD_A, { recursive: true });
   fs.mkdirSync(BUILD_B, { recursive: true });
@@ -40,9 +41,9 @@ async function main() {
   const provA  = new ethers.JsonRpcProvider(CHAIN_A_URL);
   const provB  = new ethers.JsonRpcProvider(CHAIN_B_URL);
   // Hardhat node 永遠回傳 31337，兩條鏈會衝突
-  // 改用邏輯 ID（port 號）作為合約內部的 chainId 識別碼
-  const netIdA = "8545";
-  const netIdB = "8546";
+  // 改用邏輯 ID（port 號）作為合約內部的 chainId 識別碼（見 lib/chains.js）
+  const netIdA = CHAINS.A.chainId;
+  const netIdB = CHAINS.B.chainId;
   console.log(`[Deploy] Chain A logicalId: ${netIdA}`);
   console.log(`[Deploy] Chain B logicalId: ${netIdB}`);
 

@@ -4,10 +4,12 @@
 const { Web3 } = require("web3");
 const fs   = require("fs");
 const path = require("path");
+const { CHAINS, ROOT, wsUrl } = require("../lib/chains");
+const { loadArtifact }        = require("../lib/contractArtifact");
 
-const WS_A   = "ws://127.0.0.1:8545";
-const WS_B   = "ws://127.0.0.1:8546";
-const AI_LOG = path.join(__dirname, "../logs/ai-decisions.jsonl");
+const WS_A   = wsUrl(CHAINS.A.rpcUrl);
+const WS_B   = wsUrl(CHAINS.B.rpcUrl);
+const AI_LOG = path.join(ROOT, "logs/ai-decisions.jsonl");
 
 const C = {
   reset: "\x1b[0m", bold: "\x1b[1m", dim: "\x1b[2m",
@@ -97,10 +99,10 @@ async function main() {
   console.log(`${C.dim}事件圖示：[A/B REVEAL] Phase2 ｜ [A/B COMMIT] Phase3a ｜ [A/B ABORT] Phase3b${C.reset}`);
   console.log(`${C.dim}AI  圖示：[AI▶ START] 批次送判 ｜ [AI✔ DONE] 判定完成 ｜ [AI✘ ERROR] 呼叫失敗 ｜ [AI- SKIP] 單筆跳過${C.reset}\n`);
 
-  const artA = JSON.parse(fs.readFileSync(path.join(__dirname, "../build/chainA/BridgeNode.json")));
-  const artB = JSON.parse(fs.readFileSync(path.join(__dirname, "../build/chainB/BridgeNode.json")));
-  const addrA = artA.networks[Object.keys(artA.networks).pop()].address;
-  const addrB = artB.networks[Object.keys(artB.networks).pop()].address;
+  const artA = loadArtifact(CHAINS.A.buildPath);
+  const artB = loadArtifact(CHAINS.B.buildPath);
+  const addrA = artA.address;
+  const addrB = artB.address;
 
   console.log(`${C.blue}[A]${C.reset} BridgeNode: ${C.cyan}${addrA}${C.reset}`);
   console.log(`${C.purple}[B]${C.reset} BridgeNode: ${C.cyan}${addrB}${C.reset}\n`);

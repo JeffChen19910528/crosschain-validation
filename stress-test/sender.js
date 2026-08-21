@@ -6,11 +6,12 @@ require("dotenv").config({ path: __dirname + "/../oracle/.env" });
 const { Web3 }        = require("web3");
 const pLimit          = require("p-limit");
 const ReportGenerator = require("./report-generator");
-const fs              = require("fs");
-const path            = require("path");
+const { CHAINS }       = require("../lib/chains");
+const { loadContract } = require("../lib/contractArtifact");
+const { parseArgs }    = require("../lib/cliArgs");
 
-const CHAIN_A_URL = process.env.CHAIN_A_URL || "http://127.0.0.1:8545";
-const CHAIN_B_URL = process.env.CHAIN_B_URL || "http://127.0.0.1:8546";
+const CHAIN_A_URL = CHAINS.A.rpcUrl;
+const CHAIN_B_URL = CHAINS.B.rpcUrl;
 
 const args        = parseArgs(process.argv.slice(2));
 const DURATION    = parseInt(args.duration    || "60")    * 1000;
@@ -22,19 +23,15 @@ async function main() {
   const webA = new Web3(CHAIN_A_URL);
   const webB = new Web3(CHAIN_B_URL);
 
-  const artA = JSON.parse(fs.readFileSync(path.join(__dirname, "../build/chainA/BridgeNode.json")));
-  const artB = JSON.parse(fs.readFileSync(path.join(__dirname, "../build/chainB/BridgeNode.json")));
-  const addrA = artA.networks[Object.keys(artA.networks).pop()].address;
-  const addrB = artB.networks[Object.keys(artB.networks).pop()].address;
-  const nodeA = new webA.eth.Contract(artA.abi, addrA);
-  const nodeB = new webB.eth.Contract(artB.abi, addrB);
+  const { contract: nodeA } = loadContract(webA, CHAINS.A.buildPath);
+  const { contract: nodeB } = loadContract(webB, CHAINS.B.buildPath);
 
   const accsA = await webA.eth.getAccounts();
   const accsB = await webB.eth.getAccounts();
 
-  // 使用邏輯 ID（與 deploy.js 一致），不讀 eth_chainId
-  const chainIdA = "8545";
-  const chainIdB = "8546";
+  // 使用邏輯 ID（與 lib/chains.js 一致），不讀 eth_chainId
+  const chainIdA = CHAINS.A.chainId;
+  const chainIdB = CHAINS.B.chainId;
 
   const limit     = pLimit(CONCURRENCY);
   const startTime = Date.now();
@@ -125,14 +122,6 @@ async function main() {
   });
 
   process.exit(0);
-}
-
-function parseArgs(argv) {
-  const args = {};
-  for (let i = 0; i < argv.length; i++) {
-    if (argv[i].startsWith("--")) { args[argv[i].slice(2)] = argv[i + 1]; i++; }
-  }
-  return args;
 }
 
 main().catch(err => { console.error("[Stress] Fatal:", err.message); process.exit(1); });

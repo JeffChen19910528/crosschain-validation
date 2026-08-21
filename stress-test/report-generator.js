@@ -2,6 +2,7 @@ const ExcelJS = require("exceljs");
 const dayjs   = require("dayjs");
 const path    = require("path");
 const fs      = require("fs");
+const { styleHeader } = require("../lib/statsUtils");
 
 class ReportGenerator {
   async generate(results, summary) {
@@ -29,7 +30,7 @@ class ReportGenerator {
       { key: "P95 延遲 (ms)",              value: this._pct(results, 95) },
       { key: "P99 延遲 (ms)",              value: this._pct(results, 99) },
     ]);
-    this._styleHeader(s1);
+    styleHeader(s1);
 
     // Sheet 2: 交易明細
     const s2 = workbook.addWorksheet("交易明細 Detail");
@@ -48,7 +49,7 @@ class ReportGenerator {
       { header: "錯誤訊息",    key: "error",     width: 50 },
     ];
     results.forEach(r => s2.addRow(r));
-    this._styleHeader(s2);
+    styleHeader(s2);
     s2.eachRow((row, rowNum) => {
       if (rowNum === 1) return;
       const st = row.getCell("status").value;
@@ -66,7 +67,7 @@ class ReportGenerator {
       { header: "失敗",           key: "failed",  width: 10 },
     ];
     this._tpsBySecond(results).forEach(r => s3.addRow(r));
-    this._styleHeader(s3);
+    styleHeader(s3);
 
     // Sheet 4: 每分鐘 TPS（折線圖用）
     const s4 = workbook.addWorksheet("每分鐘 TPS（折線圖）");
@@ -85,7 +86,7 @@ class ReportGenerator {
       { header: "Gas 平均 (Gwei)",    key: "avgGas",       width: 16 },
     ];
     this._tpsByMinute(results).forEach(r => s4.addRow(r));
-    this._styleHeader(s4);
+    styleHeader(s4);
     s4.getRow(1).height = 22;
     const noteRow = s4.addRow({ minute: "※ 折線圖建議", clock: "選取「時間戳」+「平均TPS」欄位插入折線圖" });
     noteRow.font = { italic: true, color: { argb: "FF888888" } };
@@ -108,7 +109,7 @@ class ReportGenerator {
       dir, count: v.count, ok: v.ok,
       rate: ((v.ok / v.count) * 100).toFixed(2) + "%",
     }));
-    this._styleHeader(s5);
+    styleHeader(s5);
 
     fs.mkdirSync(summary.reportDir, { recursive: true });
     const filename = `ao4c-report-${dayjs().format("YYYYMMDD-HHmmss")}.xlsx`;
@@ -194,14 +195,6 @@ class ReportGenerator {
     return `${String(m).padStart(2,"0")}:${String(s).padStart(2,"0")}`;
   }
 
-  _styleHeader(sheet) {
-    sheet.getRow(1).eachCell(cell => {
-      cell.font  = { bold: true, color: { argb: "FFFFFFFF" } };
-      cell.fill  = { type: "pattern", pattern: "solid", fgColor: { argb: "FF2C5F8A" } };
-      cell.alignment = { horizontal: "center" };
-    });
-    sheet.getRow(1).height = 20;
-  }
 }
 
 module.exports = ReportGenerator;

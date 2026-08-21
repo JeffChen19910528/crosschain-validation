@@ -1,6 +1,7 @@
 let web3A, web3B;
 let nodeAContract, nodeBContract;
 let accountsA = [], accountsB = [];
+let chainIds = { A: "8545", B: "8546" };
 const txHistory = [];
 
 async function init() {
@@ -8,10 +9,12 @@ async function init() {
     web3A = new Web3("http://localhost:3000/rpc/chainA");
     web3B = new Web3("http://localhost:3000/rpc/chainB");
 
-    const [artA, artB] = await Promise.all([
+    const [artA, artB, chains] = await Promise.all([
       fetch("/build/chainA/BridgeNode.json").then(r => r.json()),
       fetch("/build/chainB/BridgeNode.json").then(r => r.json()),
+      fetch("/api/chains").then(r => r.json()),
     ]);
+    chainIds = { A: chains.A.chainId, B: chains.B.chainId };
 
     const netIdsA = Object.keys(artA.networks);
     const netIdsB = Object.keys(artB.networks);
@@ -82,8 +85,8 @@ async function sendTx() {
   const srcWeb3  = isAB ? web3A : web3B;
   const srcContract = isAB ? nodeAContract : nodeBContract;
 
-  // 使用邏輯 ID（與 deploy.js 一致），不讀 eth_chainId
-  const dstChainId = isAB ? "8546" : "8545";
+  // 使用邏輯 ID（與 lib/chains.js 一致），不讀 eth_chainId
+  const dstChainId = isAB ? chainIds.B : chainIds.A;
 
   const btn = document.getElementById("sendBtn");
   btn.disabled = true;
